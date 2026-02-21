@@ -1646,11 +1646,15 @@ impl Workspace {
                     })
                 }
             }),
+            cx.observe_global::<SettingsStore>(move |this, cx| {
+                this.update_traffic_lights_visibility(cx);
+            }),
         ];
 
         cx.defer_in(window, move |this, window, cx| {
             this.update_window_title(window, cx);
             this.show_initial_notifications(cx);
+            this.update_traffic_lights_visibility(cx);
         });
 
         let mut center = PaneGroup::new(center_pane.clone());
@@ -2055,6 +2059,21 @@ impl Workspace {
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
         StatusBarSettings::get_global(cx).show
+    }
+
+    pub fn title_bar_visible(&self, cx: &App) -> bool {
+        WorkspaceSettings::get_global(cx).show_title_bar
+    }
+
+    pub fn update_traffic_lights_visibility(&self, cx: &mut App) {
+        let visible = self.title_bar_visible(cx);
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| {
+                    window.set_traffic_lights_visible(visible);
+                })
+                .ok();
+        }
     }
 
     pub fn app_state(&self) -> &Arc<AppState> {
@@ -7373,7 +7392,9 @@ impl Render for Workspace {
                 .items_start()
                 .text_color(colors.text)
                 .overflow_hidden()
-                .children(self.titlebar_item.clone())
+                .when(self.title_bar_visible(cx), |this| {
+                    this.children(self.titlebar_item.clone())
+                })
                 .on_modifiers_changed(move |_, _, cx| {
                     for &id in &notification_entities {
                         cx.notify(id);

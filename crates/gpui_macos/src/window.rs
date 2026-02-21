@@ -492,6 +492,28 @@ impl MacWindowState {
         }
     }
 
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        unsafe {
+            let close_button: id = msg_send![
+                self.native_window,
+                standardWindowButton: NSWindowButton::NSWindowCloseButton
+            ];
+            let min_button: id = msg_send![
+                self.native_window,
+                standardWindowButton: NSWindowButton::NSWindowMiniaturizeButton
+            ];
+            let zoom_button: id = msg_send![
+                self.native_window,
+                standardWindowButton: NSWindowButton::NSWindowZoomButton
+            ];
+
+            let hidden = if visible { NO } else { YES };
+            let _: () = msg_send![close_button, setHidden: hidden];
+            let _: () = msg_send![min_button, setHidden: hidden];
+            let _: () = msg_send![zoom_button, setHidden: hidden];
+        }
+    }
+
     fn start_display_link(&mut self) {
         self.stop_display_link();
         unsafe {
@@ -1616,6 +1638,10 @@ impl PlatformWindow for MacWindow {
                 }
             })
             .detach();
+    }
+
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        self.0.lock().set_traffic_lights_visible(visible);
     }
 
     fn start_window_move(&self) {

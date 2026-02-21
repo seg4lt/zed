@@ -4753,6 +4753,12 @@ impl Window {
         self.platform_window.titlebar_double_click();
     }
 
+    /// Sets the visibility of the macOS traffic light buttons (close, minimize, maximize).
+    /// This is macOS specific.
+    pub fn set_traffic_lights_visible(&self, visible: bool) {
+        self.platform_window.set_traffic_lights_visible(visible);
+    }
+
     /// Gets the window's title at the platform level.
     /// This is macOS specific.
     pub fn window_title(&self) -> String {
