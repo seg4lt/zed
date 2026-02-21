@@ -37,6 +37,10 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: false
     pub confirm_quit: Option<bool>,
+    /// Whether to show the title bar.
+    ///
+    /// Default: true
+    pub show_title_bar: Option<bool>,
     /// Whether or not to show the call status icon in the status bar.
     ///
     /// Default: true
