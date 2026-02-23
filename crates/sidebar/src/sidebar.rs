@@ -278,6 +278,20 @@ impl WorkspacePickerDelegate {
         self.rebuild_entries(workspace_threads, cx);
     }
 
+    fn has_notifications(&self) -> bool {
+        if !self.notified_workspaces.is_empty() {
+            return true;
+        }
+
+        self.entries.iter().any(|entry| match entry {
+            SidebarEntry::WorkspaceThread(thread) => thread
+                .thread_info
+                .as_ref()
+                .is_some_and(|info| info.needs_attention),
+            _ => false,
+        })
+    }
+
     fn open_workspace_path_sets(&self, cx: &App) -> Vec<Vec<Arc<Path>>> {
         self.multi_workspace
             .read(cx)
@@ -1027,13 +1041,13 @@ impl Sidebar {
 
             this.persist_thread_titles(&entries, &multi_workspace, cx);
 
-            let had_notifications = !this.picker.read(cx).delegate.notified_workspaces.is_empty();
+            let had_notifications = this.picker.read(cx).delegate.has_notifications();
             this.picker.update(cx, |picker, cx| {
                 picker.delegate.set_entries(entries, active_index, cx);
                 let query = picker.query(cx);
                 picker.update_matches(query, window, cx);
             });
-            let has_notifications = !this.picker.read(cx).delegate.notified_workspaces.is_empty();
+            let has_notifications = this.picker.read(cx).delegate.has_notifications();
             if had_notifications != has_notifications {
                 multi_workspace.update(cx, |_, cx| cx.notify());
             }
@@ -1052,7 +1066,7 @@ impl WorkspaceSidebar for Sidebar {
     }
 
     fn has_notifications(&self, cx: &App) -> bool {
-        !self.picker.read(cx).delegate.notified_workspaces.is_empty()
+        self.picker.read(cx).delegate.has_notifications()
     }
 }
 
