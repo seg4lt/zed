@@ -35,6 +35,7 @@ struct AgentThreadInfo {
     title: SharedString,
     status: AgentThreadStatus,
     icon: IconName,
+    needs_attention: bool,
 }
 
 const DEFAULT_WIDTH: Pixels = px(320.0);
@@ -95,6 +96,15 @@ impl WorkspaceThreadEntry {
         let agent_panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
         let agent_panel_ref = agent_panel.read(cx);
 
+        if agent_panel_ref.is_active_terminal_view() {
+            return Some(AgentThreadInfo {
+                title: "Terminal".into(),
+                status: AgentThreadStatus::Completed,
+                icon: IconName::Terminal,
+                needs_attention: agent_panel_ref.active_terminal_needs_attention(cx),
+            });
+        }
+
         let thread_view = agent_panel_ref.as_active_thread_view(cx)?.read(cx);
         let thread = thread_view.thread.read(cx);
 
@@ -115,6 +125,7 @@ impl WorkspaceThreadEntry {
             title,
             status,
             icon,
+            needs_attention: false,
         })
     }
 }
@@ -599,7 +610,10 @@ impl PickerDelegate for WorkspacePickerDelegate {
                     }
                 });
 
-                let has_notification = self.notified_workspaces.contains(&workspace_index);
+                let has_notification = self.notified_workspaces.contains(&workspace_index)
+                    || thread_info
+                        .as_ref()
+                        .is_some_and(|info| info.needs_attention);
                 let thread_subtitle = thread_info.as_ref().map(|info| info.title.clone());
                 let status = thread_info
                     .as_ref()
@@ -848,6 +862,7 @@ impl Sidebar {
                 title,
                 status,
                 icon: IconName::ZedAgent,
+                needs_attention: false,
             },
         );
     }
