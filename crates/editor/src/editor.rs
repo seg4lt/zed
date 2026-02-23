@@ -1171,6 +1171,7 @@ pub struct Editor {
     show_cursor_names: bool,
     hovered_cursors: HashMap<HoveredCursor, Task<()>>,
     cursor_tail_states: HashMap<CursorTrailKey, CursorTrailState>,
+    last_cursor_tail_prune: Option<Instant>,
     pub show_local_selections: bool,
     mode: EditorMode,
     show_breadcrumbs: bool,
@@ -2529,6 +2530,7 @@ impl Editor {
             show_cursor_names: false,
             hovered_cursors: HashMap::default(),
             cursor_tail_states: HashMap::default(),
+            last_cursor_tail_prune: None,
             next_editor_action_id: EditorActionId::default(),
             editor_actions: Rc::default(),
             edit_predictions_hidden_for_vim_mode: false,
@@ -23917,9 +23919,11 @@ impl Editor {
             .max(CURSOR_BLINK_INTERVAL + Duration::from_millis(100))
     }
 
+    const CURSOR_TAIL_PRUNE_INTERVAL: Duration = Duration::from_millis(150);
+
     fn cursor_tail_rebind_candidate_key(
         states: &HashMap<CursorTrailKey, CursorTrailState>,
-        active_keys: &HashSet<CursorTrailKey>,
+        active_keys: &[CursorTrailKey],
         key: CursorTrailKey,
         head: DisplayPoint,
         now: Instant,
@@ -24031,7 +24035,7 @@ impl Editor {
     pub(crate) fn record_cursor_tail_animation(
         &mut self,
         key: CursorTrailKey,
-        active_keys: &HashSet<CursorTrailKey>,
+        active_keys: &[CursorTrailKey],
         head: DisplayPoint,
         rect: CursorTrailRect,
         now: Instant,
@@ -24080,8 +24084,22 @@ impl Editor {
         });
     }
 
+    pub(crate) fn maybe_prune_cursor_tail_states(&mut self, now: Instant, max_age: Duration) {
+        let should_prune = self
+            .last_cursor_tail_prune
+            .and_then(|last_prune| now.checked_duration_since(last_prune))
+            .is_none_or(|elapsed| elapsed >= Self::CURSOR_TAIL_PRUNE_INTERVAL);
+        if !should_prune {
+            return;
+        }
+
+        self.last_cursor_tail_prune = Some(now);
+        self.prune_cursor_tail_states(now, max_age);
+    }
+
     pub(crate) fn clear_cursor_tail_states(&mut self) {
         self.cursor_tail_states.clear();
+        self.last_cursor_tail_prune = None;
     }
 
     pub fn set_show_cursor_when_unfocused(&mut self, is_enabled: bool, cx: &mut Context<Self>) {
@@ -26487,7 +26505,7 @@ mod tests {
 
         let candidate = Editor::cursor_tail_rebind_candidate_key(
             &states,
-            &HashSet::default(),
+            &[],
             desired_key,
             desired_head,
             now,
@@ -26552,9 +26570,7 @@ mod tests {
             },
         );
 
-        let mut active_keys = HashSet::default();
-        active_keys.insert(existing_key);
-        active_keys.insert(desired_key);
+        let active_keys = [existing_key, desired_key];
 
         let candidate = Editor::cursor_tail_rebind_candidate_key(
             &states,

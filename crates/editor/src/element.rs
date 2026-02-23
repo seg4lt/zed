@@ -35,7 +35,7 @@ use crate::{
     },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
-use collections::{BTreeMap, HashMap, HashSet};
+use collections::{BTreeMap, HashMap};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use file_icons::FileIcons;
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatus};
@@ -1814,21 +1814,22 @@ impl EditorElement {
                 (scroll_position.y * ScrollPixelOffset::from(line_height)).into(),
             );
             let now = Instant::now();
-            let active_cursor_tail_keys: HashSet<_> = if cursor_tail_settings.enabled {
-                selections
-                    .iter()
-                    .flat_map(|(_, selections)| selections.iter())
-                    .filter(|selection| {
-                        Self::should_show_cursor_tail(selection.cursor_shape, cursor_tail_settings)
-                    })
-                    .map(|selection| CursorTrailKey {
-                        source: selection.cursor_source,
-                        selection_id: selection.selection_id,
-                    })
-                    .collect()
-            } else {
-                HashSet::default()
-            };
+            let mut active_cursor_tail_keys: SmallVec<[CursorTrailKey; 8]> = SmallVec::new();
+            if cursor_tail_settings.enabled {
+                for (_, selections) in selections {
+                    for selection in selections {
+                        if Self::should_show_cursor_tail(
+                            selection.cursor_shape,
+                            cursor_tail_settings,
+                        ) {
+                            active_cursor_tail_keys.push(CursorTrailKey {
+                                source: selection.cursor_source,
+                                selection_id: selection.selection_id,
+                            });
+                        }
+                    }
+                }
+            }
 
             for (player_color, selections) in selections {
                 for selection in selections {
@@ -2035,7 +2036,7 @@ impl EditorElement {
 
             if cursor_tail_settings.enabled {
                 let max_age = Editor::cursor_tail_state_max_age(cursor_tail_duration);
-                editor.prune_cursor_tail_states(now, max_age);
+                editor.maybe_prune_cursor_tail_states(now, max_age);
             }
 
             cursors
@@ -6814,6 +6815,20 @@ impl EditorElement {
         a * (1.0 - t) + b * t
     }
 
+    fn cursor_tail_quantized_progress(elapsed: Duration, duration: Duration) -> f32 {
+        if duration.is_zero() {
+            return 1.0;
+        }
+        if elapsed >= duration {
+            return 1.0;
+        }
+
+        const CURSOR_TAIL_TARGET_FPS: f32 = 60.0;
+        let quantized_elapsed_seconds =
+            (elapsed.as_secs_f32() * CURSOR_TAIL_TARGET_FPS).floor() / CURSOR_TAIL_TARGET_FPS;
+        (quantized_elapsed_seconds / duration.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
     fn cursor_tail_smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
         if (edge0 - edge1).abs() <= f32::EPSILON {
             return if value < edge0 { 0.0 } else { 1.0 };
@@ -6895,7 +6910,7 @@ impl EditorElement {
             return None;
         }
 
-        let progress = (elapsed.as_secs_f32() / duration_seconds).clamp(0.0, 1.0);
+        let progress = Self::cursor_tail_quantized_progress(elapsed, duration);
 
         let current_rect = CursorTrailRect {
             origin: animation.to.origin - viewport_world_origin,
