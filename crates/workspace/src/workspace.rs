@@ -3732,6 +3732,55 @@ impl Workspace {
         panel
     }
 
+    pub fn close_panel_for_proto_id(
+        &self,
+        panel_id: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for dock in self.all_docks().iter() {
+            dock.update(cx, |dock, cx| {
+                if dock.panel_index_for_proto_id(panel_id).is_some() {
+                    dock.set_open(false, window, cx);
+                }
+            });
+        }
+    }
+
+    pub fn visible_panel_for_proto_id_is_zoomed(
+        &self,
+        panel_id: PanelId,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.all_docks().iter().any(|dock| {
+            dock.read(cx).visible_panel().is_some_and(|panel| {
+                panel.remote_id() == Some(panel_id) && panel.is_zoomed(window, cx)
+            })
+        })
+    }
+
+    pub fn set_visible_panel_zoomed_for_proto_id(
+        &self,
+        panel_id: PanelId,
+        zoomed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for dock in self.all_docks().iter() {
+            let panel = dock
+                .read(cx)
+                .visible_panel()
+                .and_then(|panel| (panel.remote_id() == Some(panel_id)).then(|| panel.clone()));
+            if let Some(panel) = panel {
+                panel.set_zoomed(zoomed, window, cx);
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Focus or unfocus the given panel type, depending on the given callback.
     fn focus_or_unfocus_panel<T: Panel>(
         &mut self,

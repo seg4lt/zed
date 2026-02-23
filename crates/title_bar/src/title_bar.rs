@@ -22,7 +22,7 @@ use crate::application_menu::{
 
 use auto_update::AutoUpdateStatus;
 use call::ActiveCall;
-use client::{Client, UserStore, zed_urls};
+use client::{Client, UserStore, proto, zed_urls};
 use cloud_api_types::Plan;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt};
 use gpui::{
@@ -58,6 +58,12 @@ pub use stories::*;
 const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleBarAgentEditorMode {
+    Agent,
+    Editor,
+}
 
 actions!(
     collab,
@@ -197,7 +203,25 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
+        children.push(
+            h_flex()
+                .id("titlebar-center-group")
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(div().flex_1().min_w_0())
+                .when_some(self.render_agent_editor_tabs(window, cx), |this, tabs| {
+                    this.child(tabs)
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_collaborator_list(window, cx)),
+                )
+                .into_any_element(),
+        );
 
         if title_bar_settings.show_onboarding_banner {
             children.push(self.banner.clone().into_any_element())
@@ -271,6 +295,160 @@ impl Render for TitleBar {
 }
 
 impl TitleBar {
+    fn agent_editor_mode(&self, window: &Window, cx: &App) -> TitleBarAgentEditorMode {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return TitleBarAgentEditorMode::Editor;
+        };
+
+        if workspace.read(cx).visible_panel_for_proto_id_is_zoomed(
+            proto::PanelId::AssistantPanel,
+            window,
+            cx,
+        ) {
+            TitleBarAgentEditorMode::Agent
+        } else {
+            TitleBarAgentEditorMode::Editor
+        }
+    }
+
+    fn activate_agent_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.activate_panel_for_proto_id(
+                    proto::PanelId::AssistantPanel,
+                    window,
+                    cx,
+                ) {
+                    panel.set_zoomed(true, window, cx);
+                }
+            })
+            .log_err();
+    }
+
+    fn activate_editor_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.set_visible_panel_zoomed_for_proto_id(
+                    proto::PanelId::AssistantPanel,
+                    false,
+                    window,
+                    cx,
+                );
+                workspace.close_panel_for_proto_id(proto::PanelId::AssistantPanel, window, cx);
+
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    window.focus(&pane.focus_handle(cx), cx);
+                });
+            })
+            .log_err();
+    }
+
+    fn render_agent_editor_tabs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !cx.has_flag::<AgentV2FeatureFlag>() {
+            return None;
+        }
+
+        let mode = self.agent_editor_mode(window, cx);
+        let colors = cx.theme().colors();
+        let outer_background = colors
+            .title_bar_background
+            .blend(gpui::black().opacity(0.14));
+        let selected_background = colors.elevated_surface_background;
+        let selected_border_color = colors.border.opacity(0.5);
+
+        Some(
+            div()
+                .id("agent-editor-tabs")
+                .flex_none()
+                .h_8()
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border.opacity(0.35))
+                .bg(outer_background)
+                .px_1()
+                .py_0p5()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    h_flex()
+                        .h_full()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("agent-mode-tab")
+                                .h_full()
+                                .min_w_16()
+                                .px_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if mode == TitleBarAgentEditorMode::Agent {
+                                    selected_border_color
+                                } else {
+                                    colors.border_transparent
+                                })
+                                .bg(if mode == TitleBarAgentEditorMode::Agent {
+                                    selected_background
+                                } else {
+                                    outer_background
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.activate_agent_mode(window, cx);
+                                }))
+                                .child({
+                                    let label = Label::new("Agent");
+                                    if mode == TitleBarAgentEditorMode::Agent {
+                                        label
+                                    } else {
+                                        label.color(Color::Disabled)
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("editor-mode-tab")
+                                .h_full()
+                                .min_w_16()
+                                .px_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if mode == TitleBarAgentEditorMode::Editor {
+                                    selected_border_color
+                                } else {
+                                    colors.border_transparent
+                                })
+                                .bg(if mode == TitleBarAgentEditorMode::Editor {
+                                    selected_background
+                                } else {
+                                    outer_background
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.activate_editor_mode(window, cx);
+                                }))
+                                .child({
+                                    let label = Label::new("Editor");
+                                    if mode == TitleBarAgentEditorMode::Editor {
+                                        label
+                                    } else {
+                                        label.color(Color::Disabled)
+                                    }
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn new(
         id: impl Into<ElementId>,
         workspace: &Workspace,

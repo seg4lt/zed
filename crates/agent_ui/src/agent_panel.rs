@@ -58,7 +58,9 @@ use prompt_store::{PromptBuilder, PromptStore, UserPromptId};
 use rules_library::{RulesLibrary, open_rules_library};
 use search::{BufferSearchBar, buffer_search};
 use settings::{Settings, update_settings_file};
+use terminal::Event as TerminalEvent;
 use theme::ThemeSettings;
+use terminal_view::TerminalView;
 use ui::{
     Callout, ContextMenu, ContextMenuEntry, KeyBinding, PopoverMenu, PopoverMenuHandle, Tab,
     Tooltip, prelude::*, utils::WithRemSize,
@@ -326,6 +328,9 @@ enum ActiveView {
     AgentThread {
         server_view: Entity<AcpServerView>,
     },
+    Terminal {
+        terminal_view: Entity<TerminalView>,
+    },
     TextThread {
         text_thread_editor: Entity<TextThreadEditor>,
         title_editor: Entity<Editor>,
@@ -349,6 +354,7 @@ enum WhichFontSize {
 pub enum AgentType {
     #[default]
     NativeAgent,
+    Terminal,
     TextThread,
     Gemini,
     ClaudeAgent,
@@ -362,6 +368,7 @@ impl AgentType {
     fn label(&self) -> SharedString {
         match self {
             Self::NativeAgent | Self::TextThread => "Zed Agent".into(),
+            Self::Terminal => "Terminal".into(),
             Self::Gemini => "Gemini CLI".into(),
             Self::ClaudeAgent => "Claude Agent".into(),
             Self::Codex => "Codex".into(),
@@ -372,6 +379,7 @@ impl AgentType {
     fn icon(&self) -> Option<IconName> {
         match self {
             Self::NativeAgent | Self::TextThread => None,
+            Self::Terminal => Some(IconName::Terminal),
             Self::Gemini => Some(IconName::AiGemini),
             Self::ClaudeAgent => Some(IconName::AiClaude),
             Self::Codex => Some(IconName::AiOpenAi),
@@ -399,7 +407,7 @@ impl ActiveView {
             | ActiveView::AgentThread { .. }
             | ActiveView::History { .. } => WhichFontSize::AgentFont,
             ActiveView::TextThread { .. } => WhichFontSize::BufferFont,
-            ActiveView::Configuration => WhichFontSize::None,
+            ActiveView::Terminal { .. } | ActiveView::Configuration => WhichFontSize::None,
         }
     }
 
@@ -511,6 +519,7 @@ pub struct AgentPanel {
     active_view: ActiveView,
     previous_view: Option<ActiveView>,
     _active_view_observation: Option<Subscription>,
+    active_terminal_has_bell: bool,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_navigation_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -787,6 +796,7 @@ impl AgentPanel {
             context_server_registry,
             previous_view: None,
             _active_view_observation: None,
+            active_terminal_has_bell: false,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
             agent_navigation_menu_handle: PopoverMenuHandle::default(),
@@ -892,6 +902,7 @@ impl AgentPanel {
         match &self.active_view {
             ActiveView::AgentThread { server_view, .. } => Some(server_view),
             ActiveView::Uninitialized
+            | ActiveView::Terminal { .. }
             | ActiveView::TextThread { .. }
             | ActiveView::History { .. }
             | ActiveView::Configuration => None,
@@ -899,7 +910,7 @@ impl AgentPanel {
     }
 
     fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_agent_thread(AgentType::NativeAgent, window, cx);
+        self.new_agent_thread(self.selected_agent.clone(), window, cx);
     }
 
     fn new_native_agent_thread_from_summary(
@@ -966,6 +977,70 @@ impl AgentPanel {
             cx,
         );
         text_thread_editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn new_terminal_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.read(cx).is_via_collab() {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Terminals are not supported in collaborative projects",
+                cx,
+            );
+            return;
+        }
+
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        let workspace_id = self.workspace_id;
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = project
+                .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+                .await;
+
+            match terminal {
+                Ok(terminal) => {
+                    this.update_in(cx, |this, window, cx| {
+                        let terminal_view = cx.new(|cx| {
+                            TerminalView::new(
+                                terminal.clone(),
+                                workspace.clone(),
+                                workspace_id,
+                                project.downgrade(),
+                                window,
+                                cx,
+                            )
+                        });
+
+                        if this.selected_agent != AgentType::Terminal {
+                            this.selected_agent = AgentType::Terminal;
+                        }
+                        this.serialize(cx);
+                        this.set_active_view(
+                            ActiveView::Terminal {
+                                terminal_view: terminal_view.clone(),
+                            },
+                            true,
+                            window,
+                            cx,
+                        );
+                        terminal_view.focus_handle(cx).focus(window, cx);
+                    })?;
+                }
+                Err(error) => {
+                    cx.update(|_window, cx| {
+                        Self::show_deferred_toast_message(
+                            &workspace,
+                            format!("Failed to create terminal: {error}"),
+                            cx,
+                        );
+                    })?;
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn external_thread(
@@ -1090,6 +1165,7 @@ impl AgentPanel {
     fn history_kind_for_selected_agent(&self, cx: &App) -> Option<HistoryKind> {
         match self.selected_agent {
             AgentType::NativeAgent => Some(HistoryKind::AgentThreads),
+            AgentType::Terminal => None,
             AgentType::TextThread => Some(HistoryKind::TextThreads),
             AgentType::Gemini
             | AgentType::ClaudeAgent
@@ -1406,6 +1482,29 @@ impl AgentPanel {
         });
     }
 
+    fn show_deferred_toast_message(
+        workspace: &WeakEntity<workspace::Workspace>,
+        message: String,
+        cx: &mut App,
+    ) {
+        let workspace = workspace.clone();
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct AgentPanelToast;
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<AgentPanelToast>(),
+                            message.clone(),
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+        });
+    }
+
     fn load_thread_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(clipboard) = cx.read_from_clipboard() else {
             Self::show_deferred_toast(&self.workspace, "No clipboard content available", cx);
@@ -1546,6 +1645,17 @@ impl AgentPanel {
         server_view.read(cx).active_thread().cloned()
     }
 
+    pub fn is_active_terminal_view(&self) -> bool {
+        matches!(self.active_view, ActiveView::Terminal { .. })
+    }
+
+    pub fn active_terminal_needs_attention(&self, cx: &App) -> bool {
+        match &self.active_view {
+            ActiveView::Terminal { terminal_view } => terminal_view.read(cx).has_bell(),
+            _ => false,
+        }
+    }
+
     pub fn active_agent_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         match &self.active_view {
             ActiveView::AgentThread { server_view, .. } => server_view
@@ -1610,13 +1720,32 @@ impl AgentPanel {
 
         self._active_view_observation = match &self.active_view {
             ActiveView::AgentThread { server_view } => {
+                self.active_terminal_has_bell = false;
                 Some(cx.observe(server_view, |this, _, cx| {
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
                     cx.notify();
                 }))
             }
-            _ => None,
+            ActiveView::Terminal { terminal_view } => {
+                self.active_terminal_has_bell = terminal_view.read(cx).has_bell();
+                Some(cx.subscribe(terminal_view, |this, terminal_view, event: &TerminalEvent, cx| {
+                    if !matches!(event, TerminalEvent::Wakeup | TerminalEvent::Bell) {
+                        return;
+                    }
+
+                    let has_bell = terminal_view.read(cx).has_bell();
+                    if this.active_terminal_has_bell != has_bell {
+                        this.active_terminal_has_bell = has_bell;
+                        cx.emit(AgentPanelEvent::ActiveViewChanged);
+                        cx.notify();
+                    }
+                }))
+            }
+            _ => {
+                self.active_terminal_has_bell = false;
+                None
+            }
         };
 
         let is_in_agent_history = matches!(
@@ -1737,7 +1866,7 @@ impl AgentPanel {
             AgentType::ClaudeAgent => Some(ExternalAgent::ClaudeCode),
             AgentType::Codex => Some(ExternalAgent::Codex),
             AgentType::Custom { name } => Some(ExternalAgent::Custom { name: name.clone() }),
-            AgentType::TextThread => None,
+            AgentType::TextThread | AgentType::Terminal => None,
         }
     }
 
@@ -1791,6 +1920,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match agent {
+            AgentType::Terminal => self.new_terminal_view(window, cx),
             AgentType::TextThread => {
                 window.dispatch_action(NewTextThread.boxed_clone(), cx);
             }
@@ -1888,6 +2018,7 @@ impl Focusable for AgentPanel {
         match &self.active_view {
             ActiveView::Uninitialized => self.focus_handle.clone(),
             ActiveView::AgentThread { server_view, .. } => server_view.focus_handle(cx),
+            ActiveView::Terminal { terminal_view } => terminal_view.focus_handle(cx),
             ActiveView::History { kind } => match kind {
                 HistoryKind::AgentThreads => self.acp_history.focus_handle(cx),
                 HistoryKind::TextThreads => self.text_thread_history.focus_handle(cx),
@@ -2116,6 +2247,7 @@ impl AgentPanel {
                         .into_any_element(),
                 }
             }
+            ActiveView::Terminal { .. } => Label::new("Terminal").truncate().into_any_element(),
             ActiveView::History { kind } => {
                 let title = match kind {
                     HistoryKind::AgentThreads => "History",
@@ -2361,6 +2493,7 @@ impl AgentPanel {
         let active_thread = match &self.active_view {
             ActiveView::AgentThread { server_view } => server_view.read(cx).as_native_thread(cx),
             ActiveView::Uninitialized
+            | ActiveView::Terminal { .. }
             | ActiveView::TextThread { .. }
             | ActiveView::History { .. }
             | ActiveView::Configuration => None,
@@ -2472,6 +2605,33 @@ impl AgentPanel {
                                                         panel.update(cx, |panel, cx| {
                                                             panel.new_agent_thread(
                                                                 AgentType::TextThread,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                            .item(
+                                ContextMenuEntry::new("Terminal")
+                                    .toggle(IconPosition::End, is_agent_selected(AgentType::Terminal))
+                                    .icon(IconName::Terminal)
+                                    .icon_color(Color::Muted)
+                                    .disabled(is_via_collab)
+                                    .handler({
+                                        let workspace = workspace.clone();
+                                        move |window, cx| {
+                                            if let Some(workspace) = workspace.upgrade() {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    if let Some(panel) =
+                                                        workspace.panel::<AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.new_agent_thread(
+                                                                AgentType::Terminal,
                                                                 window,
                                                                 cx,
                                                             );
@@ -2762,6 +2922,7 @@ impl AgentPanel {
             }
             ActiveView::Uninitialized
             | ActiveView::AgentThread { .. }
+            | ActiveView::Terminal { .. }
             | ActiveView::History { .. }
             | ActiveView::Configuration => return false,
         }
@@ -2790,7 +2951,10 @@ impl AgentPanel {
         }
 
         match &self.active_view {
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
+            ActiveView::Uninitialized
+            | ActiveView::Terminal { .. }
+            | ActiveView::History { .. }
+            | ActiveView::Configuration => {
                 false
             }
             ActiveView::AgentThread { server_view, .. }
@@ -3071,6 +3235,7 @@ impl AgentPanel {
                     thread_view.insert_dragged_files(paths, added_worktrees, window, cx);
                 });
             }
+            ActiveView::Terminal { .. } => {}
             ActiveView::TextThread {
                 text_thread_editor, ..
             } => {
@@ -3126,7 +3291,10 @@ impl AgentPanel {
         match &self.active_view {
             ActiveView::AgentThread { .. } => key_context.add("acp_thread"),
             ActiveView::TextThread { .. } => key_context.add("text_thread"),
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {}
+            ActiveView::Uninitialized
+            | ActiveView::Terminal { .. }
+            | ActiveView::History { .. }
+            | ActiveView::Configuration => {}
         }
         key_context
     }
@@ -3188,6 +3356,7 @@ impl Render for AgentPanel {
                     ActiveView::AgentThread { server_view, .. } => parent
                         .child(server_view.clone())
                         .child(self.render_drag_target(cx)),
+                    ActiveView::Terminal { terminal_view } => parent.child(terminal_view.clone()),
                     ActiveView::History { kind } => match kind {
                         HistoryKind::AgentThreads => parent.child(self.acp_history.clone()),
                         HistoryKind::TextThreads => parent.child(self.text_thread_history.clone()),
