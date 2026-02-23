@@ -992,10 +992,15 @@ impl AgentPanel {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
+        let terminal_cwd = self.project.read(cx).active_project_directory(cx)
+            .map(|path| path.to_path_buf())
+            .or_else(|| self.project.read(cx).first_project_directory(cx));
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+                .update(cx, |project, cx| {
+                    project.create_terminal_shell(terminal_cwd.clone(), cx)
+                })
                 .await;
 
             match terminal {

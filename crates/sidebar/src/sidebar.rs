@@ -1,13 +1,15 @@
 use acp_thread::ThreadStatus;
 use agent_ui::{AgentPanel, AgentPanelEvent};
+use anyhow::{Result, anyhow};
 use chrono::{Datelike, Local, NaiveDate, TimeDelta};
 use db::kvp::KEY_VALUE_STORE;
+use editor::Editor;
 
 use fs::Fs;
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render, SharedString,
-    Subscription, Task, Window, px,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, px,
 };
 use picker::{Picker, PickerDelegate};
 use project::Event as ProjectEvent;
@@ -17,18 +19,20 @@ use std::fmt::Display;
 use std::collections::{HashMap, HashSet};
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::utils::TRAFFIC_LIGHT_PADDING;
 use ui::{
-    AgentThreadStatus, Divider, DividerColor, KeyBinding, ListSubHeader, Tab, ThreadItem, Tooltip,
-    prelude::*,
+    AgentThreadStatus, Button, ButtonStyle, ContextMenu, Divider, DividerColor, KeyBinding,
+    ListSubHeader, PopoverMenu, Tab, ThreadItem, Tooltip, prelude::*,
 };
 use ui_input::ErasedEditor;
 use util::ResultExt as _;
 use workspace::{
-    FocusWorkspaceSidebar, MultiWorkspace, NewWorkspaceInWindow, Sidebar as WorkspaceSidebar,
-    SidebarEvent, ToggleWorkspaceSidebar, Workspace,
+    FocusWorkspaceSidebar, ModalView, MultiWorkspace, NewWorkspaceInWindow,
+    Sidebar as WorkspaceSidebar, SidebarEvent, ToggleWorkspaceSidebar, Workspace,
+    notifications::DetachAndPromptErr,
 };
 
 #[derive(Clone, Debug)]
@@ -40,6 +44,7 @@ struct AgentThreadInfo {
 }
 
 const LAST_THREAD_TITLES_KEY: &str = "sidebar-last-thread-titles";
+const WORKSPACE_DISPLAY_NAMES_KEY: &str = "sidebar-workspace-display-names";
 
 const DEFAULT_WIDTH: Pixels = px(320.0);
 const MIN_WIDTH: Pixels = px(200.0);
@@ -51,6 +56,7 @@ struct WorkspaceThreadEntry {
     index: usize,
     worktree_label: SharedString,
     full_path: SharedString,
+    custom_name: Option<SharedString>,
     thread_info: Option<AgentThreadInfo>,
 }
 
@@ -59,6 +65,7 @@ impl WorkspaceThreadEntry {
         index: usize,
         workspace: &Entity<Workspace>,
         persisted_titles: &HashMap<String, String>,
+        persisted_workspace_names: &HashMap<String, String>,
         cx: &App,
     ) -> Self {
         let workspace_ref = workspace.read(cx);
@@ -90,6 +97,16 @@ impl WorkspaceThreadEntry {
             .join("\n")
             .into();
 
+        let custom_name = if worktrees.is_empty() {
+            None
+        } else {
+            let path_key = sorted_paths_key(&worktrees);
+            persisted_workspace_names
+                .get(&path_key)
+                .cloned()
+                .map(SharedString::from)
+        };
+
         let thread_info = Self::thread_info(workspace, cx).or_else(|| {
             if worktrees.is_empty() {
                 return None;
@@ -108,6 +125,7 @@ impl WorkspaceThreadEntry {
             index,
             worktree_label,
             full_path,
+            custom_name,
             thread_info,
         }
     }
@@ -420,6 +438,488 @@ fn open_recent_project(paths: Vec<PathBuf>, window: &mut Window, cx: &mut App) {
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeAddMode {
+    CreateBranch,
+    CheckoutBranch,
+}
+
+impl WorktreeAddMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CreateBranch => "Create",
+            Self::CheckoutBranch => "Checkout",
+        }
+    }
+}
+
+fn workspace_path_key_for_index(
+    multi_workspace: &Entity<MultiWorkspace>,
+    workspace_index: usize,
+    cx: &App,
+) -> Option<String> {
+    let workspace = multi_workspace
+        .read(cx)
+        .workspaces()
+        .get(workspace_index)?
+        .clone();
+    let paths: Vec<_> = workspace
+        .read(cx)
+        .worktrees(cx)
+        .filter(|worktree| worktree.read(cx).is_visible())
+        .map(|worktree| worktree.read(cx).abs_path())
+        .collect();
+    if paths.is_empty() {
+        None
+    } else {
+        Some(sorted_paths_key(&paths))
+    }
+}
+
+fn workspace_git_defaults_for_index(
+    multi_workspace: &Entity<MultiWorkspace>,
+    workspace_index: usize,
+    cx: &App,
+) -> (String, String) {
+    let Some(workspace) = multi_workspace
+        .read(cx)
+        .workspaces()
+        .get(workspace_index)
+        .cloned()
+    else {
+        return ("worktree".to_string(), "../WT_worktree".to_string());
+    };
+    let project = workspace.read(cx).project().clone();
+    let git_store = project.read(cx).git_store().clone();
+    let branch_name = {
+        let git_store = git_store.read(cx);
+        git_store
+            .active_repository()
+            .or_else(|| git_store.repositories().values().next().cloned())
+            .and_then(|repo| {
+                repo.read(cx)
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name().to_string())
+            })
+            .unwrap_or_else(|| "worktree".to_string())
+    };
+
+    let sanitized_branch = branch_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let suffix = if sanitized_branch.is_empty() {
+        "worktree"
+    } else {
+        sanitized_branch.as_str()
+    };
+
+    (branch_name, format!("../WT_{suffix}"))
+}
+
+fn selected_workspace_repo_root_for_index(
+    multi_workspace: &MultiWorkspace,
+    workspace_index: usize,
+    cx: &App,
+) -> Result<(Entity<Workspace>, Arc<Path>, bool)> {
+    let workspace = multi_workspace
+        .workspaces()
+        .get(workspace_index)
+        .cloned()
+        .ok_or_else(|| anyhow!("Workspace no longer exists"))?;
+    let project = workspace.read(cx).project().clone();
+    let is_local = project.read(cx).is_local();
+    let git_store = project.read(cx).git_store().clone();
+    let repo = {
+        let git_store = git_store.read(cx);
+        git_store
+            .active_repository()
+            .or_else(|| git_store.repositories().values().next().cloned())
+    }
+    .ok_or_else(|| anyhow!("No git repository found for this workspace"))?;
+    let repo_root = repo.read(cx).work_directory_abs_path.clone();
+    Ok((workspace, repo_root, is_local))
+}
+
+struct EditWorkspaceNameModal {
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    workspace_index: usize,
+    editor: Entity<Editor>,
+}
+
+impl EditWorkspaceNameModal {
+    fn new(
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        workspace_index: usize,
+        initial_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Workspace name", window, cx);
+            editor.set_text(initial_name, window, cx);
+            editor
+        });
+        Self {
+            multi_workspace,
+            workspace_index,
+            editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.editor.read(cx).text(cx).trim().to_string();
+        if name.is_empty() {
+            let _ = window.prompt(
+                gpui::PromptLevel::Info,
+                "Name required",
+                Some("Enter a workspace name."),
+                &["Ok"],
+                cx,
+            );
+            return;
+        }
+
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            cx.emit(DismissEvent);
+            return;
+        };
+        let Some(path_key) =
+            workspace_path_key_for_index(&multi_workspace, self.workspace_index, cx)
+        else {
+            let _ = window.prompt(
+                gpui::PromptLevel::Info,
+                "Cannot rename workspace",
+                Some("This workspace does not have a visible path yet."),
+                &["Ok"],
+                cx,
+            );
+            return;
+        };
+
+        let task = cx.spawn(async move |_, cx| {
+            let mut names = read_workspace_display_name_map().unwrap_or_default();
+            names.insert(path_key, name);
+            let json = serde_json::to_string(&names)?;
+            KEY_VALUE_STORE
+                .write_kvp(WORKSPACE_DISPLAY_NAMES_KEY.into(), json)
+                .await?;
+            multi_workspace.update(cx, |_, cx| cx.notify());
+            anyhow::Ok(())
+        });
+        task.detach_and_prompt_err("Failed to save workspace name", window, cx, |e, _, _| {
+            Some(e.to_string())
+        });
+
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for EditWorkspaceNameModal {}
+impl ModalView for EditWorkspaceNameModal {}
+impl Focusable for EditWorkspaceNameModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for EditWorkspaceNameModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("WorkspaceEditNameModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .w(px(440.0))
+            .elevation_2(cx)
+            .rounded_md()
+            .bg(cx.theme().colors().surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .child(Label::new("Edit Workspace Name"))
+                    .child(
+                        Label::new("Set a custom display name for this workspace.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(self.editor.clone())
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-edit-workspace-name", "Cancel")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel(&menu::Cancel, window, cx);
+                                    })),
+                            )
+                            .child(Button::new("confirm-edit-workspace-name", "Save").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm(&menu::Confirm, window, cx);
+                                }),
+                            )),
+                    ),
+            )
+    }
+}
+
+struct AddWorkspaceWorktreeModal {
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    workspace_index: usize,
+    mode: WorktreeAddMode,
+    branch_editor: Entity<Editor>,
+    path_editor: Entity<Editor>,
+}
+
+impl AddWorkspaceWorktreeModal {
+    fn new(
+        multi_workspace: WeakEntity<MultiWorkspace>,
+        workspace_index: usize,
+        default_branch: String,
+        default_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Branch name", window, cx);
+            editor.set_text(default_branch, window, cx);
+            editor
+        });
+        let path_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Path (relative or absolute)", window, cx);
+            editor.set_text(default_path, window, cx);
+            editor
+        });
+
+        Self {
+            multi_workspace,
+            workspace_index,
+            mode: WorktreeAddMode::CreateBranch,
+            branch_editor,
+            path_editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let branch_name = self.branch_editor.read(cx).text(cx).trim().to_string();
+        let path_input = self.path_editor.read(cx).text(cx).trim().to_string();
+
+        if branch_name.is_empty() || path_input.is_empty() {
+            let _ = window.prompt(
+                gpui::PromptLevel::Info,
+                "Missing worktree inputs",
+                Some("Enter both a branch name and a path."),
+                &["Ok"],
+                cx,
+            );
+            return;
+        }
+
+        let mode = self.mode;
+        let workspace_index = self.workspace_index;
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            cx.emit(DismissEvent);
+            return;
+        };
+
+        let task = cx.spawn_in(window, async move |_, cx| {
+            let (_workspace, repo_root, is_local) =
+                multi_workspace.read_with(cx, |multi_workspace, cx| {
+                    selected_workspace_repo_root_for_index(multi_workspace, workspace_index, cx)
+                })?;
+
+            if !is_local {
+                anyhow::bail!("Worktree Add is only supported for local workspaces");
+            }
+
+            let requested_path = PathBuf::from(path_input);
+            let target_path = if requested_path.is_absolute() {
+                requested_path
+            } else {
+                repo_root.join(requested_path)
+            };
+
+            let repo_root_for_command = repo_root.clone();
+            let branch_for_command = branch_name.clone();
+            let target_path_for_command = target_path.clone();
+
+            cx.background_spawn(async move {
+                if let Some(parent) = target_path_for_command.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let mut command = Command::new("git");
+                command
+                    .current_dir(repo_root_for_command.as_ref())
+                    .arg("--no-optional-locks")
+                    .arg("worktree")
+                    .arg("add");
+
+                match mode {
+                    WorktreeAddMode::CreateBranch => {
+                        command
+                            .arg("-b")
+                            .arg(&branch_for_command)
+                            .arg("--")
+                            .arg(&target_path_for_command)
+                            .arg("HEAD");
+                    }
+                    WorktreeAddMode::CheckoutBranch => {
+                        command
+                            .arg("--")
+                            .arg(&target_path_for_command)
+                            .arg(&branch_for_command);
+                    }
+                }
+
+                let output = command.output()?;
+                if output.status.success() {
+                    Ok::<(), anyhow::Error>(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    anyhow::bail!(
+                        "git worktree add failed{}",
+                        if stderr.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {stderr}")
+                        }
+                    );
+                }
+            })
+            .await?;
+
+            multi_workspace
+                .update_in(cx, |multi_workspace, window, cx| {
+                    multi_workspace.open_project(vec![target_path], window, cx)
+                })?
+                .await?;
+            multi_workspace.update(cx, |_, cx| cx.notify());
+            anyhow::Ok(())
+        });
+
+        task.detach_and_prompt_err("Failed to add worktree", window, cx, |e, _, _| {
+            Some(e.to_string())
+        });
+
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for AddWorkspaceWorktreeModal {}
+impl ModalView for AddWorkspaceWorktreeModal {}
+impl Focusable for AddWorkspaceWorktreeModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.branch_editor.focus_handle(cx)
+    }
+}
+
+impl Render for AddWorkspaceWorktreeModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let create_selected = self.mode == WorktreeAddMode::CreateBranch;
+        let checkout_selected = self.mode == WorktreeAddMode::CheckoutBranch;
+
+        v_flex()
+            .key_context("WorkspaceAddWorktreeModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .w(px(520.0))
+            .elevation_2(cx)
+            .rounded_md()
+            .bg(cx.theme().colors().surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .child(Label::new("Worktree Add"))
+                    .child(
+                        Label::new("Choose whether to create a branch or checkout an existing branch, then pick the worktree path.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("worktree-mode-create", "Create")
+                                    .style(if create_selected {
+                                        ButtonStyle::Tinted(ui::TintColor::Accent)
+                                    } else {
+                                        ButtonStyle::Subtle
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mode = WorktreeAddMode::CreateBranch;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("worktree-mode-checkout", "Checkout")
+                                    .style(if checkout_selected {
+                                        ButtonStyle::Tinted(ui::TintColor::Accent)
+                                    } else {
+                                        ButtonStyle::Subtle
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mode = WorktreeAddMode::CheckoutBranch;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Label::new(format!("Mode: {}", self.mode.label()))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(Label::new("Branch").size(LabelSize::Small).color(Color::Muted))
+                    .child(self.branch_editor.clone())
+                    .child(Label::new("Path").size(LabelSize::Small).color(Color::Muted))
+                    .child(self.path_editor.clone())
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-add-worktree", "Cancel")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel(&menu::Cancel, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-add-worktree", "Add Worktree")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm(&menu::Confirm, window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
 impl PickerDelegate for WorkspacePickerDelegate {
     type ListItem = AnyElement;
 
@@ -632,8 +1132,10 @@ impl PickerDelegate for WorkspacePickerDelegate {
                 let worktree_label = thread_entry.worktree_label.clone();
                 let full_path = thread_entry.full_path.clone();
                 let thread_info = thread_entry.thread_info.clone();
+                let custom_name = thread_entry.custom_name.clone();
                 let workspace_index = thread_entry.index;
                 let multi_workspace = self.multi_workspace.clone();
+                let multi_workspace_for_remove = multi_workspace.clone();
                 let workspace_count = self.multi_workspace.read(cx).workspaces().len();
                 let is_hovered = self.hovered_thread_item == Some(workspace_index);
 
@@ -645,7 +1147,7 @@ impl PickerDelegate for WorkspacePickerDelegate {
                 .icon_color(Color::Muted)
                 .tooltip(Tooltip::text("Remove Workspace"))
                 .on_click({
-                    let multi_workspace = multi_workspace;
+                    let multi_workspace = multi_workspace_for_remove;
                     move |_, window, cx| {
                         multi_workspace.update(cx, |mw, cx| {
                             mw.remove_workspace(workspace_index, window, cx);
@@ -658,6 +1160,10 @@ impl PickerDelegate for WorkspacePickerDelegate {
                         .as_ref()
                         .is_some_and(|info| info.needs_attention);
                 let thread_subtitle = thread_info.as_ref().map(|info| info.title.clone());
+                let display_title = custom_name
+                    .clone()
+                    .or_else(|| thread_subtitle.clone())
+                    .unwrap_or_else(|| SharedString::from("New Thread"));
                 let status = thread_info
                     .as_ref()
                     .map_or(AgentThreadStatus::default(), |info| info.status);
@@ -666,45 +1172,124 @@ impl PickerDelegate for WorkspacePickerDelegate {
                     AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
                 );
 
+                let menu_button = PopoverMenu::new(format!("workspace-row-menu-{workspace_index}"))
+                    .trigger(
+                        IconButton::new(
+                            format!("workspace-actions-{}", workspace_index),
+                            IconName::Ellipsis,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Workspace Actions")),
+                    )
+                    .menu({
+                        let multi_workspace = multi_workspace.clone();
+                        let edit_name_default = display_title.to_string();
+                        move |window, cx| {
+                            let multi_workspace = multi_workspace.clone();
+                            let edit_name_default = edit_name_default.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.entry("Worktree Add", None, {
+                                    let multi_workspace = multi_workspace.clone();
+                                    move |window, cx| {
+                                        let (default_branch, default_path) =
+                                            workspace_git_defaults_for_index(
+                                                &multi_workspace,
+                                                workspace_index,
+                                                cx,
+                                            );
+                                        multi_workspace.update(cx, |multi_workspace, cx| {
+                                            let multi_workspace_handle = cx.weak_entity();
+                                            multi_workspace.toggle_modal(
+                                                window,
+                                                cx,
+                                                |window, cx| {
+                                                    AddWorkspaceWorktreeModal::new(
+                                                        multi_workspace_handle,
+                                                        workspace_index,
+                                                        default_branch.clone(),
+                                                        default_path.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            );
+                                        });
+                                    }
+                                })
+                                .entry("Edit Name", None, {
+                                    let multi_workspace = multi_workspace.clone();
+                                    let initial_name = edit_name_default.clone();
+                                    move |window, cx| {
+                                        multi_workspace.update(cx, |multi_workspace, cx| {
+                                            let multi_workspace_handle = cx.weak_entity();
+                                            multi_workspace.toggle_modal(
+                                                window,
+                                                cx,
+                                                |window, cx| {
+                                                    EditWorkspaceNameModal::new(
+                                                        multi_workspace_handle,
+                                                        workspace_index,
+                                                        initial_name.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            );
+                                        });
+                                    }
+                                })
+                            }))
+                        }
+                    });
+
+                let action_slot = h_flex()
+                    .gap_1()
+                    .child(menu_button)
+                    .when(workspace_count > 1, |this| this.child(remove_btn));
+
                 Some(
-                    ThreadItem::new(
-                        ("workspace-item", thread_entry.index),
-                        thread_subtitle.unwrap_or("New Thread".into()),
-                    )
-                    .icon(
-                        thread_info
-                            .as_ref()
-                            .map_or(IconName::ZedAgent, |info| info.icon),
-                    )
-                    .running(running)
-                    .generation_done(has_notification)
-                    .status(status)
-                    .selected(selected)
-                    .worktree(worktree_label.clone())
-                    .worktree_highlight_positions(positions.clone())
-                    .when(workspace_count > 1, |item| item.action_slot(remove_btn))
-                    .hovered(is_hovered)
-                    .on_hover(cx.listener(move |picker, is_hovered, _window, cx| {
-                        let mut changed = false;
-                        if *is_hovered {
-                            if picker.delegate.hovered_thread_item != Some(workspace_index) {
-                                picker.delegate.hovered_thread_item = Some(workspace_index);
+                    ThreadItem::new(("workspace-item", thread_entry.index), display_title)
+                        .icon(
+                            thread_info
+                                .as_ref()
+                                .map_or(IconName::ZedAgent, |info| info.icon),
+                        )
+                        .running(running)
+                        .generation_done(has_notification)
+                        .status(status)
+                        .selected(selected)
+                        .worktree(worktree_label.clone())
+                        .worktree_highlight_positions(positions.clone())
+                        .action_slot(action_slot)
+                        .action_slot_always_visible(true)
+                        .hovered(is_hovered)
+                        .on_hover(cx.listener(move |picker, is_hovered, _window, cx| {
+                            let mut changed = false;
+                            if *is_hovered {
+                                if picker.delegate.hovered_thread_item != Some(workspace_index) {
+                                    picker.delegate.hovered_thread_item = Some(workspace_index);
+                                    changed = true;
+                                }
+                            } else if picker.delegate.hovered_thread_item == Some(workspace_index) {
+                                picker.delegate.hovered_thread_item = None;
                                 changed = true;
                             }
-                        } else if picker.delegate.hovered_thread_item == Some(workspace_index) {
-                            picker.delegate.hovered_thread_item = None;
-                            changed = true;
-                        }
-                        if changed {
-                            cx.notify();
-                        }
-                    }))
-                    .when(!full_path.is_empty(), |this| {
-                        this.tooltip(move |_, cx| {
-                            Tooltip::with_meta(worktree_label.clone(), None, full_path.clone(), cx)
+                            if changed {
+                                cx.notify();
+                            }
+                        }))
+                        .when(!full_path.is_empty(), |this| {
+                            this.tooltip(move |_, cx| {
+                                Tooltip::with_meta(
+                                    worktree_label.clone(),
+                                    None,
+                                    full_path.clone(),
+                                    cx,
+                                )
+                            })
                         })
-                    })
-                    .into_any_element(),
+                        .into_any_element(),
                 )
             }
             SidebarEntry::RecentProject(project_entry) => {
@@ -864,6 +1449,7 @@ impl Sidebar {
         cx: &App,
     ) -> (Vec<WorkspaceThreadEntry>, usize) {
         let persisted_titles = read_thread_title_map().unwrap_or_default();
+        let persisted_workspace_names = read_workspace_display_name_map().unwrap_or_default();
 
         #[allow(unused_mut)]
         let mut entries: Vec<WorkspaceThreadEntry> = multi_workspace
@@ -871,7 +1457,13 @@ impl Sidebar {
             .iter()
             .enumerate()
             .map(|(index, workspace)| {
-                WorkspaceThreadEntry::new(index, workspace, &persisted_titles, cx)
+                WorkspaceThreadEntry::new(
+                    index,
+                    workspace,
+                    &persisted_titles,
+                    &persisted_workspace_names,
+                    cx,
+                )
             })
             .collect();
 
@@ -1088,6 +1680,14 @@ fn sorted_paths_key<P: AsRef<Path>>(paths: &[P]) -> String {
 fn read_thread_title_map() -> Option<HashMap<String, String>> {
     let json = KEY_VALUE_STORE
         .read_kvp(LAST_THREAD_TITLES_KEY)
+        .log_err()
+        .flatten()?;
+    serde_json::from_str(&json).log_err()
+}
+
+fn read_workspace_display_name_map() -> Option<HashMap<String, String>> {
+    let json = KEY_VALUE_STORE
+        .read_kvp(WORKSPACE_DISPLAY_NAMES_KEY)
         .log_err()
         .flatten()?;
     serde_json::from_str(&json).log_err()

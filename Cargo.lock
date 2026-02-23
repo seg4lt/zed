@@ -15398,6 +15398,7 @@ version = "0.1.0"
 dependencies = [
  "acp_thread",
  "agent_ui",
+ "anyhow",
  "chrono",
  "db",
  "editor",
@@ -15405,6 +15406,7 @@ dependencies = [
  "fs",
  "fuzzy",
  "gpui",
+ "menu",
  "picker",
  "project",
  "recent_projects",
