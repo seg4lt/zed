@@ -33,6 +33,7 @@ pub struct ThreadItem {
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
+    action_slot_always_visible: bool,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
 }
 
@@ -56,6 +57,7 @@ impl ThreadItem {
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
+            action_slot_always_visible: false,
             tooltip: None,
         }
     }
@@ -138,6 +140,11 @@ impl ThreadItem {
         self
     }
 
+    pub fn action_slot_always_visible(mut self, always_visible: bool) -> Self {
+        self.action_slot_always_visible = always_visible;
+        self
+    }
+
     pub fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
         self.tooltip = Some(Box::new(tooltip));
         self
@@ -208,7 +215,8 @@ impl RenderOnce for ThreadItem {
             icon_container().child(agent_icon)
         };
 
-        let running_or_action = self.running || (self.hovered && self.action_slot.is_some());
+        let show_action_slot = self.action_slot_always_visible || self.hovered;
+        let running_or_action = self.running || (show_action_slot && self.action_slot.is_some());
 
         // let has_no_changes = self.added.is_none() && self.removed.is_none();
 
@@ -261,7 +269,7 @@ impl RenderOnce for ThreadItem {
                                             .child(SpinnerLabel::new().color(Color::Accent)),
                                     )
                                 })
-                                .when(self.hovered, |this| {
+                                .when(show_action_slot, |this| {
                                     this.when_some(self.action_slot, |this, slot| this.child(slot))
                                 }),
                         )
