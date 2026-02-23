@@ -1871,7 +1871,9 @@ impl EditorElement {
                         .iter()
                         .any(|range| range.start <= cursor_position && cursor_position < range.end);
 
-                    if selection.cursor_shape == CursorShape::Block && !is_cursor_in_redacted_range
+                    if selection.cursor_shape == CursorShape::Block
+                        && !is_cursor_in_redacted_range
+                        && !hide_local_cursor_body
                     {
                         if let Some(text) = snapshot.grapheme_at(cursor_position).or_else(|| {
                             if snapshot.is_empty() {
@@ -12185,15 +12187,16 @@ impl CursorTailLayout {
                 ));
             }
             CursorTailShape::Slanted(points) => {
-                let mut builder = gpui::PathBuilder::fill();
-                builder.move_to(points[0] + origin);
-                builder.line_to(points[1] + origin);
-                builder.line_to(points[2] + origin);
-                builder.line_to(points[3] + origin);
-                builder.close();
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, self.color);
-                }
+                let p0 = points[0] + origin;
+                let p1 = points[1] + origin;
+                let p2 = points[2] + origin;
+                let p3 = points[3] + origin;
+
+                let mut path = gpui::Path::new(p0);
+                let st = (point(0., 1.), point(0., 1.), point(0., 1.));
+                path.push_triangle((p0, p1, p2), st);
+                path.push_triangle((p0, p2, p3), st);
+                window.paint_path(path, self.color);
             }
         }
     }

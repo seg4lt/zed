@@ -23985,44 +23985,13 @@ impl Editor {
         }
     }
 
-    pub(crate) fn record_cursor_tail_animation(
-        &mut self,
-        key: CursorTrailKey,
-        active_keys: &HashSet<CursorTrailKey>,
+    fn update_cursor_tail_state(
+        state: &mut CursorTrailState,
         head: DisplayPoint,
         rect: CursorTrailRect,
         now: Instant,
         duration: Duration,
     ) -> Option<CursorTrailAnimationState> {
-        let mut state = if let Some(state) = self.cursor_tail_states.remove(&key) {
-            state
-        } else {
-            let max_age = Self::cursor_tail_state_max_age(duration);
-            let rebound_state = Self::cursor_tail_rebind_candidate_key(
-                &self.cursor_tail_states,
-                active_keys,
-                key,
-                head,
-                now,
-                max_age,
-            )
-            .and_then(|candidate_key| self.cursor_tail_states.remove(&candidate_key));
-
-            let Some(rebound_state) = rebound_state else {
-                self.cursor_tail_states.insert(
-                    key,
-                    CursorTrailState {
-                        last_head: head,
-                        last_rect: rect,
-                        animation: None,
-                        last_seen: now,
-                    },
-                );
-                return None;
-            };
-            rebound_state
-        };
-
         let moved = state.last_head != head || state.last_rect.size != rect.size;
         if moved {
             let from = state
@@ -24056,6 +24025,50 @@ impl Editor {
             animation = None;
         }
 
+        animation
+    }
+
+    pub(crate) fn record_cursor_tail_animation(
+        &mut self,
+        key: CursorTrailKey,
+        active_keys: &HashSet<CursorTrailKey>,
+        head: DisplayPoint,
+        rect: CursorTrailRect,
+        now: Instant,
+        duration: Duration,
+    ) -> Option<CursorTrailAnimationState> {
+        if let Some(state) = self.cursor_tail_states.get_mut(&key) {
+            return Self::update_cursor_tail_state(state, head, rect, now, duration);
+        }
+
+        let mut state = {
+            let max_age = Self::cursor_tail_state_max_age(duration);
+            let rebound_state = Self::cursor_tail_rebind_candidate_key(
+                &self.cursor_tail_states,
+                active_keys,
+                key,
+                head,
+                now,
+                max_age,
+            )
+            .and_then(|candidate_key| self.cursor_tail_states.remove(&candidate_key));
+
+            let Some(rebound_state) = rebound_state else {
+                self.cursor_tail_states.insert(
+                    key,
+                    CursorTrailState {
+                        last_head: head,
+                        last_rect: rect,
+                        animation: None,
+                        last_seen: now,
+                    },
+                );
+                return None;
+            };
+            rebound_state
+        };
+
+        let animation = Self::update_cursor_tail_state(&mut state, head, rect, now, duration);
         self.cursor_tail_states.insert(key, state);
         animation
     }
