@@ -165,6 +165,10 @@ pub(crate) struct MacPlatformState {
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
+    global_focus_toggle_hotkey: Option<Box<dyn FnMut()>>,
+    global_focus_toggle_hotkey_registration_ready: bool,
+    global_focus_toggle_hotkey_handler_ref: EventHandlerRef,
+    global_focus_toggle_hotkey_ref: EventHotKeyRef,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     on_thermal_state_change: Option<Box<dyn FnMut()>>,
     quit: Option<Box<dyn FnMut()>>,
@@ -201,6 +205,10 @@ impl MacPlatform {
             general_pasteboard: Pasteboard::general(),
             find_pasteboard: Pasteboard::find(),
             reopen: None,
+            global_focus_toggle_hotkey: None,
+            global_focus_toggle_hotkey_registration_ready: false,
+            global_focus_toggle_hotkey_handler_ref: ptr::null_mut(),
+            global_focus_toggle_hotkey_ref: ptr::null_mut(),
             quit: None,
             menu_command: None,
             validate_menu_command: None,
@@ -441,6 +449,128 @@ impl MacPlatform {
             version.patchVersion,
         )
     }
+
+    fn try_register_global_focus_toggle_hotkey(&self) {
+        let should_register = {
+            let state = self.0.lock();
+            !state.headless
+                && state.global_focus_toggle_hotkey_registration_ready
+                && state.global_focus_toggle_hotkey.is_some()
+                && state.global_focus_toggle_hotkey_handler_ref.is_null()
+                && state.global_focus_toggle_hotkey_ref.is_null()
+        };
+        if !should_register {
+            return;
+        }
+
+        unsafe {
+            let event_type = EventTypeSpec {
+                event_class: K_EVENT_CLASS_KEYBOARD,
+                event_kind: K_EVENT_HOT_KEY_PRESSED,
+            };
+            let mut handler_ref: EventHandlerRef = ptr::null_mut();
+            let install_status = InstallEventHandler(
+                GetApplicationEventTarget(),
+                Some(handle_global_focus_toggle_hotkey_event),
+                1,
+                &event_type,
+                self as *const Self as *mut c_void,
+                &mut handler_ref,
+            );
+            if install_status != 0 {
+                log::error!(
+                    "failed to install global focus toggle hotkey handler: OSStatus {}",
+                    install_status
+                );
+                return;
+            }
+
+            let hotkey_id = EventHotKeyID {
+                signature: GLOBAL_FOCUS_TOGGLE_HOTKEY_SIGNATURE,
+                id: GLOBAL_FOCUS_TOGGLE_HOTKEY_ID,
+            };
+            let mut hotkey_ref: EventHotKeyRef = ptr::null_mut();
+            let register_status = RegisterEventHotKey(
+                GLOBAL_FOCUS_TOGGLE_HOTKEY_KEY_CODE,
+                GLOBAL_FOCUS_TOGGLE_HOTKEY_MODIFIERS,
+                hotkey_id,
+                GetApplicationEventTarget(),
+                0,
+                &mut hotkey_ref,
+            );
+            if register_status != 0 {
+                let remove_status = RemoveEventHandler(handler_ref);
+                if remove_status != 0 {
+                    log::error!(
+                        "failed to remove global focus toggle hotkey handler after registration error: OSStatus {}",
+                        remove_status
+                    );
+                }
+                log::error!(
+                    "failed to register global focus toggle hotkey: OSStatus {}",
+                    register_status
+                );
+                return;
+            }
+
+            let mut state = self.0.lock();
+            if state.global_focus_toggle_hotkey_handler_ref.is_null()
+                && state.global_focus_toggle_hotkey_ref.is_null()
+            {
+                state.global_focus_toggle_hotkey_handler_ref = handler_ref;
+                state.global_focus_toggle_hotkey_ref = hotkey_ref;
+            } else {
+                drop(state);
+
+                let unregister_status = UnregisterEventHotKey(hotkey_ref);
+                if unregister_status != 0 {
+                    log::error!(
+                        "failed to unregister duplicate global focus toggle hotkey registration: OSStatus {}",
+                        unregister_status
+                    );
+                }
+                let remove_status = RemoveEventHandler(handler_ref);
+                if remove_status != 0 {
+                    log::error!(
+                        "failed to remove duplicate global focus toggle hotkey handler: OSStatus {}",
+                        remove_status
+                    );
+                }
+            }
+        }
+    }
+
+    fn unregister_global_focus_toggle_hotkey(&self) {
+        let (handler_ref, hotkey_ref) = {
+            let mut state = self.0.lock();
+            let handler_ref = state.global_focus_toggle_hotkey_handler_ref;
+            let hotkey_ref = state.global_focus_toggle_hotkey_ref;
+            state.global_focus_toggle_hotkey_handler_ref = ptr::null_mut();
+            state.global_focus_toggle_hotkey_ref = ptr::null_mut();
+            (handler_ref, hotkey_ref)
+        };
+
+        unsafe {
+            if !hotkey_ref.is_null() {
+                let unregister_status = UnregisterEventHotKey(hotkey_ref);
+                if unregister_status != 0 {
+                    log::error!(
+                        "failed to unregister global focus toggle hotkey: OSStatus {}",
+                        unregister_status
+                    );
+                }
+            }
+            if !handler_ref.is_null() {
+                let remove_status = RemoveEventHandler(handler_ref);
+                if remove_status != 0 {
+                    log::error!(
+                        "failed to remove global focus toggle hotkey handler: OSStatus {}",
+                        remove_status
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl Platform for MacPlatform {
@@ -475,6 +605,8 @@ impl Platform for MacPlatform {
             let self_ptr = self as *const Self as *const c_void;
             (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
             (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
+            self.0.lock().global_focus_toggle_hotkey_registration_ready = true;
+            self.try_register_global_focus_toggle_hotkey();
 
             let pool = NSAutoreleasePool::new(nil);
             app.run();
@@ -868,6 +1000,11 @@ impl Platform for MacPlatform {
         self.0.lock().reopen = Some(callback);
     }
 
+    fn on_global_focus_toggle_hotkey(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().global_focus_toggle_hotkey = Some(callback);
+        self.try_register_global_focus_toggle_hotkey();
+    }
+
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().on_keyboard_layout_change = Some(callback);
     }
@@ -1233,6 +1370,7 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
 
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
     let platform = unsafe { get_mac_platform(this) };
+    platform.unregister_global_focus_toggle_hotkey();
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.quit.take() {
         drop(lock);
@@ -1376,6 +1514,25 @@ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
     }
 }
 
+extern "C" fn handle_global_focus_toggle_hotkey_event(
+    _: EventHandlerCallRef,
+    _: EventRef,
+    user_data: *mut c_void,
+) -> OSStatus {
+    let platform = unsafe { &*(user_data as *const MacPlatform) };
+    let mut lock = platform.0.lock();
+    if let Some(mut callback) = lock.global_focus_toggle_hotkey.take() {
+        drop(lock);
+        callback();
+        platform
+            .0
+            .lock()
+            .global_focus_toggle_hotkey
+            .get_or_insert(callback);
+    }
+    0
+}
+
 unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
     let path: *mut c_char = msg_send![url, fileSystemRepresentation];
     anyhow::ensure!(!path.is_null(), "url is not a file path: {}", unsafe {
@@ -1410,7 +1567,59 @@ unsafe extern "C" {
     pub(super) static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
     pub(super) static kTISPropertyInputSourceID: CFStringRef;
     pub(super) static kTISPropertyLocalizedName: CFStringRef;
+
+    pub(super) fn InstallEventHandler(
+        target: EventTargetRef,
+        handler: EventHandlerProcPtr,
+        num_types: u32,
+        event_list: *const EventTypeSpec,
+        user_data: *mut c_void,
+        handler_ref: *mut EventHandlerRef,
+    ) -> OSStatus;
+    pub(super) fn RemoveEventHandler(handler_ref: EventHandlerRef) -> OSStatus;
+    pub(super) fn RegisterEventHotKey(
+        hotkey_code: u32,
+        hotkey_modifiers: u32,
+        hotkey_id: EventHotKeyID,
+        target: EventTargetRef,
+        options: u32,
+        out_ref: *mut EventHotKeyRef,
+    ) -> OSStatus;
+    pub(super) fn UnregisterEventHotKey(hotkey_ref: EventHotKeyRef) -> OSStatus;
+    pub(super) fn GetApplicationEventTarget() -> EventTargetRef;
 }
+
+pub(super) type EventHandlerCallRef = *mut c_void;
+pub(super) type EventRef = *mut c_void;
+pub(super) type EventTargetRef = *mut c_void;
+pub(super) type EventHandlerRef = *mut c_void;
+pub(super) type EventHotKeyRef = *mut c_void;
+pub(super) type EventHandlerProcPtr =
+    Option<extern "C" fn(EventHandlerCallRef, EventRef, *mut c_void) -> OSStatus>;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(super) struct EventTypeSpec {
+    event_class: u32,
+    event_kind: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(super) struct EventHotKeyID {
+    signature: u32,
+    id: u32,
+}
+
+const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962; // 'keyb'
+const K_EVENT_HOT_KEY_PRESSED: u32 = 6;
+const CMD_KEY: u32 = 1 << 8;
+const SHIFT_KEY: u32 = 1 << 9;
+const OPTION_KEY: u32 = 1 << 11;
+const GLOBAL_FOCUS_TOGGLE_HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"ZDFI");
+const GLOBAL_FOCUS_TOGGLE_HOTKEY_ID: u32 = 1;
+const GLOBAL_FOCUS_TOGGLE_HOTKEY_KEY_CODE: u32 = 34; // kVK_ANSI_I
+const GLOBAL_FOCUS_TOGGLE_HOTKEY_MODIFIERS: u32 = CMD_KEY | SHIFT_KEY | OPTION_KEY;
 
 mod security {
     #![allow(non_upper_case_globals)]

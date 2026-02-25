@@ -132,6 +132,35 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
     cx.update(|cx| fail_to_open_window(e, cx));
 }
 
+fn spawn_restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        if let Err(e) = restore_or_create_workspace(app_state, cx).await {
+            fail_to_open_window_async(e, cx)
+        }
+    })
+    .detach();
+}
+
+fn activate_last_workspace_window_or_restore_workspace(app_state: Arc<AppState>, cx: &mut App) {
+    let workspace_window = cx
+        .window_stack()
+        .unwrap_or_else(|| cx.windows())
+        .into_iter()
+        .find_map(|window| window.downcast::<MultiWorkspace>());
+
+    if let Some(workspace_window) = workspace_window {
+        cx.activate(true);
+        workspace_window
+            .update(cx, |_, window, _| {
+                window.activate_window();
+            })
+            .log_err();
+        return;
+    }
+
+    spawn_restore_or_create_workspace(app_state, cx);
+}
+
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     eprintln!(
         "Zed failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
@@ -429,15 +458,18 @@ fn main() {
     app.on_reopen(move |cx| {
         if let Some(app_state) = AppState::try_global(cx).and_then(|app_state| app_state.upgrade())
         {
-            cx.spawn({
-                let app_state = app_state;
-                async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
-                        fail_to_open_window_async(e, cx)
-                    }
-                }
-            })
-            .detach();
+            activate_last_workspace_window_or_restore_workspace(app_state, cx);
+        }
+    });
+    app.on_global_focus_toggle_hotkey(move |cx| {
+        if cx.active_window().is_some() {
+            cx.hide();
+            return;
+        }
+
+        if let Some(app_state) = AppState::try_global(cx).and_then(|app_state| app_state.upgrade())
+        {
+            activate_last_workspace_window_or_restore_workspace(app_state, cx);
         }
     });
 
