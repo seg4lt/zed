@@ -477,7 +477,7 @@ ztracing_macro = { path = "crates/ztracing_macro" }
 
 agent-client-protocol = { version = "=0.9.4", features = ["unstable"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 arrayvec = { version = "0.7.4", features = ["serde"] }
@@ -849,6 +849,7 @@ windows-capture = { git = "https://github.com/zed-industries/windows-capture.git
 calloop = { git = "https://github.com/zed-industries/calloop" }
 livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
 libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
+vte = { path = "vendor/vte" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
