@@ -6,6 +6,7 @@ use language::LanguageRegistry;
 use markdown::Markdown;
 use project::Project;
 use std::{
+    ffi::OsStr,
     path::PathBuf,
     process::ExitStatus,
     sync::{
@@ -224,6 +225,14 @@ pub async fn create_terminal_entity(
     env.insert("GIT_PAGER".into(), "cat".into());
     env.extend(env_vars);
 
+    if command_looks_like_claude_code(&command) {
+        // Claude Code's `auto` notification mode does not recognize Zed's TERM_PROGRAM.
+        // Advertising Ghostty-compatible TERM_PROGRAM for agent-launched Claude sessions
+        // allows it to pick OSC 777 notifications, which we map to terminal attention.
+        env.entry("TERM_PROGRAM".into())
+            .or_insert_with(|| "Ghostty".into());
+    }
+
     // Use remote shell or default system shell, as appropriate
     let shell = project
         .update(cx, |project, cx| {
@@ -252,4 +261,18 @@ pub async fn create_terminal_entity(
             )
         })
         .await
+}
+
+fn command_looks_like_claude_code(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let trimmed = token
+            .trim_matches(|character| matches!(character, '\'' | '"' | '`'))
+            .rsplit_once('=')
+            .map_or(token, |(_, value)| value);
+
+        PathBuf::from(trimmed)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|file_name| matches!(file_name, "claude" | "claude.exe"))
+    })
 }
