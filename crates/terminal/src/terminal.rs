@@ -387,6 +387,7 @@ impl TerminalBuilder {
             term,
             term_config: config,
             title_override: None,
+            has_bell: false,
             events: VecDeque::with_capacity(10),
             last_content: Default::default(),
             last_mouse: None,
@@ -615,6 +616,7 @@ impl TerminalBuilder {
                 term,
                 term_config: config,
                 title_override: terminal_title_override,
+                has_bell: false,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 last_mouse: None,
@@ -848,6 +850,7 @@ pub struct Terminal {
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<FairMutex<Term<ZedListener>>>,
     term_config: Config,
+    has_bell: bool,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(AlacPoint, AlacDirection)>,
@@ -971,9 +974,11 @@ impl Terminal {
                 cx.emit(Event::BlinkChanged(blinking));
             }
             AlacTermEvent::Bell => {
+                self.has_bell = true;
                 cx.emit(Event::Bell);
             }
             AlacTermEvent::TerminalNotification { .. } => {
+                self.has_bell = true;
                 cx.emit(Event::Bell);
             }
             AlacTermEvent::Exit => self.register_task_finished(Some(9), cx),
@@ -2198,6 +2203,14 @@ impl Terminal {
 
     pub fn task(&self) -> Option<&TaskState> {
         self.task.as_ref()
+    }
+
+    pub fn has_bell(&self) -> bool {
+        self.has_bell
+    }
+
+    pub fn clear_bell(&mut self) {
+        self.has_bell = false;
     }
 
     pub fn wait_for_completed_task(&self, cx: &App) -> Task<Option<ExitStatus>> {
