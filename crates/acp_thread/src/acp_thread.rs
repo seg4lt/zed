@@ -82,7 +82,8 @@ fn prepare_builtin_agent_terminal_environment(
     for environment_variable in extra_environment_variables {
         environment.insert(environment_variable.name, environment_variable.value);
     }
-    environment.insert("TERM_PROGRAM".into(), "Ghostty".into());
+    // Claude Code's terminal detection expects lowercase `ghostty`.
+    environment.insert("TERM_PROGRAM".into(), "ghostty".into());
     environment
 }
 
@@ -2700,7 +2701,7 @@ mod tests {
 
         assert_eq!(
             prepared_environment.get("TERM_PROGRAM"),
-            Some(&"Ghostty".to_string())
+            Some(&"ghostty".to_string())
         );
     }
 

@@ -228,10 +228,10 @@ pub async fn create_terminal_entity(
     let looks_like_claude_code = command_looks_like_claude_code(&command);
     if looks_like_claude_code {
         // Claude Code's `auto` notification mode does not recognize Zed's TERM_PROGRAM.
-        // Advertising Ghostty-compatible TERM_PROGRAM for agent-launched Claude sessions
+        // Advertising ghostty-compatible TERM_PROGRAM for agent-launched Claude sessions
         // allows it to pick OSC 777 notifications, which we map to terminal attention.
         env.entry("TERM_PROGRAM".into())
-            .or_insert_with(|| "Ghostty".into());
+            .or_insert_with(|| "ghostty".into());
     }
 
     // Use remote shell or default system shell, as appropriate
