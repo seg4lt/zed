@@ -334,4 +334,25 @@ mod tests {
 
         assert_eq!(wrapped.as_ref(), command);
     }
+
+    #[test]
+    fn claude_shell_command_keeps_terminal_identity_after_shell_wrapping() {
+        let wrapped_command =
+            command_with_claude_notification_terminal_identity("claude --print hello", false)
+                .into_owned();
+        let (shell_program, shell_arguments) = task::ShellBuilder::new(
+            &Shell::Program("/bin/bash".to_string()),
+            false,
+        )
+        .redirect_stdin_to_dev_null()
+        .build(Some(wrapped_command), &[]);
+
+        let mut shell_invocation = vec![shell_program];
+        shell_invocation.extend(shell_arguments);
+        let shell_invocation = shell_invocation.join(" ");
+
+        assert!(shell_invocation.contains("TERM_PROGRAM=ghostty"));
+        assert!(shell_invocation.contains("TERM=xterm-ghostty"));
+        assert!(shell_invocation.contains("claude --print hello"));
+    }
 }

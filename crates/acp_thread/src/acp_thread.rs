@@ -2817,6 +2817,63 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_builtin_terminal_osc_777_notification_emits_bell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| connection.new_session(project, Path::new(path!("/test")), cx))
+            .await
+            .unwrap();
+
+        let terminal = thread
+            .update(cx, |thread, cx| {
+                thread.create_terminal(
+                    "sleep 0.2; printf '\\033]777;notify;Claude Code;Waiting for input\\a'"
+                        .to_string(),
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let lower_terminal = terminal.read_with(cx, |terminal, _| terminal.inner().clone());
+        let saw_bell = Arc::new(AtomicBool::new(false));
+        let saw_bell_captured = saw_bell.clone();
+
+        cx.update(|cx| {
+            cx.subscribe(
+                &lower_terminal,
+                move |_terminal, event: &::terminal::Event, _cx| {
+                    if matches!(event, ::terminal::Event::Bell) {
+                        saw_bell_captured.store(true, SeqCst);
+                    }
+                },
+            )
+            .detach();
+        });
+
+        let wait_for_exit = terminal.read_with(cx, |terminal, _| terminal.wait_for_exit());
+        wait_for_exit.await;
+        cx.run_until_parked();
+
+        assert!(
+            saw_bell.load(SeqCst),
+            "expected OSC 777 notification to be captured as terminal bell event"
+        );
+    }
+
     /// Test that killing a terminal via Terminal::kill properly:
     /// 1. Causes wait_for_exit to complete (doesn't hang forever)
     /// 2. The underlying terminal still has the output that was written before the kill
