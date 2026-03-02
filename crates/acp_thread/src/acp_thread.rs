@@ -72,6 +72,20 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+fn prepare_builtin_agent_terminal_environment(
+    environment: impl std::iter::IntoIterator<Item = (String, String)>,
+    extra_environment_variables: Vec<acp::EnvVariable>,
+) -> collections::HashMap<String, String> {
+    let mut environment = collections::HashMap::from_iter(environment);
+    // Disables paging for `git` and hopefully other commands.
+    environment.insert("PAGER".into(), "".into());
+    for environment_variable in extra_environment_variables {
+        environment.insert(environment_variable.name, environment_variable.value);
+    }
+    environment.insert("TERM_PROGRAM".into(), "Ghostty".into());
+    environment
+}
+
 #[derive(Debug)]
 pub struct UserMessage {
     pub id: Option<UserMessageId>,
@@ -2460,13 +2474,8 @@ impl AcpThread {
             None => Task::ready(None).shared(),
         };
         let env = cx.spawn(async move |_, _| {
-            let mut env = env.await.unwrap_or_default();
-            // Disables paging for `git` and hopefully other commands
-            env.insert("PAGER".into(), "".into());
-            for var in extra_env {
-                env.insert(var.name, var.value);
-            }
-            env
+            let environment = env.await.unwrap_or_default();
+            prepare_builtin_agent_terminal_environment(environment, extra_env)
         });
 
         let project = self.project.clone();
@@ -2681,6 +2690,42 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[test]
+    fn prepare_builtin_agent_terminal_environment_sets_term_program_to_ghostty() {
+        let environment =
+            collections::HashMap::from_iter([("TERM_PROGRAM".to_string(), "zed".to_string())]);
+        let prepared_environment = prepare_builtin_agent_terminal_environment(environment, vec![]);
+
+        assert_eq!(
+            prepared_environment.get("TERM_PROGRAM"),
+            Some(&"Ghostty".to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_builtin_agent_terminal_environment_preserves_unrelated_variables() {
+        let environment = collections::HashMap::from_iter([(
+            "CUSTOM_VALUE".to_string(),
+            "preserved".to_string(),
+        )]);
+        let prepared_environment = prepare_builtin_agent_terminal_environment(environment, vec![]);
+
+        assert_eq!(
+            prepared_environment.get("CUSTOM_VALUE"),
+            Some(&"preserved".to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_builtin_agent_terminal_environment_preserves_pager_override_ordering() {
+        let prepared_environment = prepare_builtin_agent_terminal_environment(
+            collections::HashMap::default(),
+            vec![acp::EnvVariable::new("PAGER".to_string(), "less".to_string())],
+        );
+
+        assert_eq!(prepared_environment.get("PAGER"), Some(&"less".to_string()));
     }
 
     #[gpui::test]
