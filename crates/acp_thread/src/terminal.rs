@@ -225,7 +225,8 @@ pub async fn create_terminal_entity(
     env.insert("GIT_PAGER".into(), "cat".into());
     env.extend(env_vars);
 
-    if command_looks_like_claude_code(&command) {
+    let looks_like_claude_code = command_looks_like_claude_code(&command);
+    if looks_like_claude_code {
         // Claude Code's `auto` notification mode does not recognize Zed's TERM_PROGRAM.
         // Advertising Ghostty-compatible TERM_PROGRAM for agent-launched Claude sessions
         // allows it to pick OSC 777 notifications, which we map to terminal attention.
@@ -265,10 +266,8 @@ pub async fn create_terminal_entity(
 
 fn command_looks_like_claude_code(command: &str) -> bool {
     command.split_whitespace().any(|token| {
-        let trimmed = token
-            .trim_matches(|character| matches!(character, '\'' | '"' | '`'))
-            .rsplit_once('=')
-            .map_or(token, |(_, value)| value);
+        let trimmed = token.trim_matches(|character| matches!(character, '\'' | '"' | '`'));
+        let trimmed = trimmed.rsplit_once('=').map_or(trimmed, |(_, value)| value);
 
         PathBuf::from(trimmed)
             .file_name()
