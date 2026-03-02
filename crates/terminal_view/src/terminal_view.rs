@@ -266,12 +266,13 @@ impl TerminalView {
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
+        let has_bell = terminal.read(cx).has_bell();
 
         Self {
             terminal,
             workspace: workspace_handle,
             project,
-            has_bell: false,
+            has_bell,
             focus_handle,
             context_menu: None,
             cursor_shape,
@@ -483,6 +484,7 @@ impl TerminalView {
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
+        self.terminal.update(cx, |terminal, _| terminal.clear_bell());
         cx.emit(Event::Wakeup);
     }
 
@@ -2090,6 +2092,60 @@ mod tests {
     }
 
     // Terminal rename tests
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_late_attached_terminal_view_preserves_prior_osc_777_bell(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace) = init_test(cx).await;
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(
+                    task::SpawnInTerminal {
+                        command: Some("sh".to_string()),
+                        args: vec![
+                            "-c".to_string(),
+                            "printf '\\033]777;notify;Claude Code;Waiting for input\\a'"
+                                .to_string(),
+                        ],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let wait_for_completion =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
+        wait_for_completion.await;
+        cx.run_until_parked();
+
+        let terminal_view = cx
+            .add_window(|window, cx| {
+                TerminalView::new(
+                    terminal,
+                    workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+            .root(cx)
+            .unwrap();
+
+        terminal_view.read_with(cx, |view, _| {
+            assert!(
+                view.has_bell(),
+                "expected terminal view to retain bell state emitted before view attachment"
+            );
+        });
+    }
 
     #[gpui::test]
     async fn test_custom_title_initially_none(cx: &mut TestAppContext) {
