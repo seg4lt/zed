@@ -6,6 +6,7 @@ use language::LanguageRegistry;
 use markdown::Markdown;
 use project::Project;
 use std::{
+    borrow::Cow,
     ffi::OsStr,
     path::PathBuf,
     process::ExitStatus,
@@ -244,9 +245,10 @@ pub async fn create_terminal_entity(
         })
         .unwrap_or_else(|| Shell::Program(get_default_system_shell_preferring_bash()));
     let is_windows = project.read_with(cx, |project, cx| project.path_style(cx).is_windows());
+    let command = command_with_claude_notification_terminal_identity(&command, is_windows);
     let (task_command, task_args) = task::ShellBuilder::new(&shell, is_windows)
         .redirect_stdin_to_dev_null()
-        .build(Some(command.clone()), &args);
+        .build(Some(command.into_owned()), &args);
 
     project
         .update(cx, |project, cx| {
@@ -274,4 +276,62 @@ fn command_looks_like_claude_code(command: &str) -> bool {
             .and_then(OsStr::to_str)
             .is_some_and(|file_name| matches!(file_name, "claude" | "claude.exe"))
     })
+}
+
+pub(crate) fn command_with_claude_notification_terminal_identity<'a>(
+    command: &'a str,
+    is_windows: bool,
+) -> Cow<'a, str> {
+    if is_windows || !command_looks_like_claude_code(command) {
+        return Cow::Borrowed(command);
+    }
+
+    Cow::Owned(format!("TERM_PROGRAM=ghostty TERM=xterm-ghostty {command}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_claude_command_with_notification_terminal_identity_on_posix() {
+        let command = "claude --print 'hello'";
+
+        let wrapped = command_with_claude_notification_terminal_identity(command, false);
+
+        assert_eq!(
+            wrapped.as_ref(),
+            "TERM_PROGRAM=ghostty TERM=xterm-ghostty claude --print 'hello'"
+        );
+    }
+
+    #[test]
+    fn wraps_quoted_claude_path_with_notification_terminal_identity_on_posix() {
+        let command = "\"/opt/bin/claude\" --print";
+
+        let wrapped = command_with_claude_notification_terminal_identity(command, false);
+
+        assert_eq!(
+            wrapped.as_ref(),
+            "TERM_PROGRAM=ghostty TERM=xterm-ghostty \"/opt/bin/claude\" --print"
+        );
+    }
+
+    #[test]
+    fn leaves_non_claude_commands_unchanged() {
+        let command = "cargo test";
+
+        let wrapped = command_with_claude_notification_terminal_identity(command, false);
+
+        assert_eq!(wrapped.as_ref(), command);
+    }
+
+    #[test]
+    fn leaves_windows_commands_unchanged() {
+        let command = "claude --print hello";
+
+        let wrapped = command_with_claude_notification_terminal_identity(command, true);
+
+        assert_eq!(wrapped.as_ref(), command);
+    }
 }

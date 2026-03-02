@@ -2451,10 +2451,13 @@ impl AcpThread {
                             .and_then(|r| r.read(cx).default_system_shell())
                     })
                     .unwrap_or_else(|| get_default_system_shell_preferring_bash());
+                let wrapped_command = terminal::command_with_claude_notification_terminal_identity(
+                    &command, is_windows,
+                );
                 let (task_command, task_args) =
                     ShellBuilder::new(&Shell::Program(shell), is_windows)
                         .redirect_stdin_to_dev_null()
-                        .build(Some(command.clone()), &args);
+                        .build(Some(wrapped_command.into_owned()), &args);
                 let terminal = project
                     .update(cx, |project, cx| {
                         project.create_terminal_task(
