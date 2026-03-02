@@ -1361,7 +1361,11 @@ where
                 .trim()
                 .to_owned();
 
-            if value.is_empty() { None } else { Some(value) }
+            if value.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
         }
 
         match params[0] {
@@ -1490,7 +1494,11 @@ where
                     params.get(1).and_then(|param| join_osc_text(&[*param]))
                 };
                 let body = if has_options {
-                    if params.len() > 3 { join_osc_text(&params[3..]) } else { None }
+                    if params.len() > 3 {
+                        join_osc_text(&params[3..])
+                    } else {
+                        None
+                    }
                 } else if params.len() > 2 {
                     join_osc_text(&params[2..])
                 } else {

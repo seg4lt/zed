@@ -59,8 +59,8 @@ use rules_library::{RulesLibrary, open_rules_library};
 use search::{BufferSearchBar, buffer_search};
 use settings::{Settings, update_settings_file};
 use terminal::Event as TerminalEvent;
-use theme::ThemeSettings;
 use terminal_view::TerminalView;
+use theme::ThemeSettings;
 use ui::{
     Callout, ContextMenu, ContextMenuEntry, KeyBinding, PopoverMenu, PopoverMenuHandle, Tab,
     Tooltip, prelude::*, utils::WithRemSize,
@@ -992,7 +992,10 @@ impl AgentPanel {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
-        let terminal_cwd = self.project.read(cx).active_project_directory(cx)
+        let terminal_cwd = self
+            .project
+            .read(cx)
+            .active_project_directory(cx)
             .map(|path| path.to_path_buf())
             .or_else(|| self.project.read(cx).first_project_directory(cx));
 
@@ -1734,18 +1737,21 @@ impl AgentPanel {
             }
             ActiveView::Terminal { terminal_view } => {
                 self.active_terminal_has_bell = terminal_view.read(cx).has_bell();
-                Some(cx.subscribe(terminal_view, |this, terminal_view, event: &TerminalEvent, cx| {
-                    if !matches!(event, TerminalEvent::Wakeup | TerminalEvent::Bell) {
-                        return;
-                    }
+                Some(cx.subscribe(
+                    terminal_view,
+                    |this, terminal_view, event: &TerminalEvent, cx| {
+                        if !matches!(event, TerminalEvent::Wakeup | TerminalEvent::Bell) {
+                            return;
+                        }
 
-                    let has_bell = terminal_view.read(cx).has_bell();
-                    if this.active_terminal_has_bell != has_bell {
-                        this.active_terminal_has_bell = has_bell;
-                        cx.emit(AgentPanelEvent::ActiveViewChanged);
-                        cx.notify();
-                    }
-                }))
+                        let has_bell = terminal_view.read(cx).has_bell();
+                        if this.active_terminal_has_bell != has_bell {
+                            this.active_terminal_has_bell = has_bell;
+                            cx.emit(AgentPanelEvent::ActiveViewChanged);
+                            cx.notify();
+                        }
+                    },
+                ))
             }
             _ => {
                 self.active_terminal_has_bell = false;
@@ -2622,7 +2628,10 @@ impl AgentPanel {
                             )
                             .item(
                                 ContextMenuEntry::new("Terminal")
-                                    .toggle(IconPosition::End, is_agent_selected(AgentType::Terminal))
+                                    .toggle(
+                                        IconPosition::End,
+                                        is_agent_selected(AgentType::Terminal),
+                                    )
                                     .icon(IconName::Terminal)
                                     .icon_color(Color::Muted)
                                     .disabled(is_via_collab)
@@ -2959,9 +2968,7 @@ impl AgentPanel {
             ActiveView::Uninitialized
             | ActiveView::Terminal { .. }
             | ActiveView::History { .. }
-            | ActiveView::Configuration => {
-                false
-            }
+            | ActiveView::Configuration => false,
             ActiveView::AgentThread { server_view, .. }
                 if server_view.read(cx).as_native_thread(cx).is_none() =>
             {
