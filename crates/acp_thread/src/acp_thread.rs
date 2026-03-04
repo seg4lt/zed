@@ -82,8 +82,6 @@ fn prepare_builtin_agent_terminal_environment(
     for environment_variable in extra_environment_variables {
         environment.insert(environment_variable.name, environment_variable.value);
     }
-    // Claude Code's terminal detection expects lowercase `ghostty`.
-    environment.insert("TERM_PROGRAM".into(), "ghostty".into());
     environment
 }
 
@@ -2495,13 +2493,10 @@ impl AcpThread {
                             .and_then(|r| r.read(cx).default_system_shell())
                     })
                     .unwrap_or_else(|| get_default_system_shell_preferring_bash());
-                let wrapped_command = terminal::command_with_claude_notification_terminal_identity(
-                    &command, is_windows,
-                );
                 let (task_command, task_args) =
                     ShellBuilder::new(&Shell::Program(shell), is_windows)
                         .redirect_stdin_to_dev_null()
-                        .build(Some(wrapped_command.into_owned()), &args);
+                        .build(Some(command.clone()), &args);
                 let terminal = project
                     .update(cx, |project, cx| {
                         project.create_terminal_task(
@@ -2697,14 +2692,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_builtin_agent_terminal_environment_sets_term_program_to_ghostty() {
+    fn prepare_builtin_agent_terminal_environment_preserves_term_program() {
         let environment =
             collections::HashMap::from_iter([("TERM_PROGRAM".to_string(), "zed".to_string())]);
         let prepared_environment = prepare_builtin_agent_terminal_environment(environment, vec![]);
 
         assert_eq!(
             prepared_environment.get("TERM_PROGRAM"),
-            Some(&"ghostty".to_string())
+            Some(&"zed".to_string())
         );
     }
 
@@ -2726,7 +2721,10 @@ mod tests {
     fn prepare_builtin_agent_terminal_environment_preserves_pager_override_ordering() {
         let prepared_environment = prepare_builtin_agent_terminal_environment(
             collections::HashMap::default(),
-            vec![acp::EnvVariable::new("PAGER".to_string(), "less".to_string())],
+            vec![acp::EnvVariable::new(
+                "PAGER".to_string(),
+                "less".to_string(),
+            )],
         );
 
         assert_eq!(prepared_environment.get("PAGER"), Some(&"less".to_string()));
@@ -2871,11 +2869,89 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[gpui::test]
-    async fn test_builtin_terminal_osc_777_notification_emits_bell(
+    async fn test_terminal_provider_output_parses_split_osc_777_notification(
         cx: &mut gpui::TestAppContext,
     ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| connection.new_session(project, std::path::Path::new(path!("/test")), cx))
+            .await
+            .unwrap();
+
+        let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
+        let lower = cx.new(|cx| {
+            let builder = ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap();
+            builder.subscribe(cx)
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "Split OSC Test".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower.clone(),
+                },
+                cx,
+            );
+        });
+
+        let saw_bell = Arc::new(AtomicBool::new(false));
+        let saw_bell_captured = saw_bell.clone();
+        cx.update(|cx| {
+            cx.subscribe(&lower, move |_terminal, event: &::terminal::Event, _cx| {
+                if matches!(event, ::terminal::Event::Bell) {
+                    saw_bell_captured.store(true, SeqCst);
+                }
+            })
+            .detach();
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b"\x1b]777;notify;Agent".to_vec(),
+                },
+                cx,
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b";Waiting for input\x07".to_vec(),
+                },
+                cx,
+            );
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            saw_bell.load(SeqCst),
+            "expected split OSC 777 provider output to be captured as terminal bell event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_builtin_terminal_osc_777_notification_emits_bell(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         cx.executor().allow_parking();
 
@@ -2890,8 +2966,7 @@ mod tests {
         let terminal = thread
             .update(cx, |thread, cx| {
                 thread.create_terminal(
-                    "sleep 0.2; printf '\\033]777;notify;Claude Code;Waiting for input\\a'"
-                        .to_string(),
+                    "sleep 0.2; printf '\\033]777;notify;Agent;Waiting for input\\a'".to_string(),
                     vec![],
                     vec![],
                     None,

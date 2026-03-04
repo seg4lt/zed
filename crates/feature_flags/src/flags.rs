@@ -2,10 +2,7 @@ use crate::FeatureFlag;
 use std::sync::LazyLock;
 
 static ZED_ENABLE_AGENT_V2: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("ZED_ENABLE_AGENT_V2")
-        .ok()
-        .as_deref()
-        .is_some_and(is_truthy_flag_value)
+    true
 });
 
 fn is_truthy_flag_value(value: &str) -> bool {
