@@ -421,6 +421,10 @@ impl TerminalBuilder {
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
+            output_parser: alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new(),
+            output_prev_input_byte: None,
         };
 
         Ok(TerminalBuilder {
@@ -653,6 +657,10 @@ impl TerminalBuilder {
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
+                output_parser: alacritty_terminal::vte::ansi::Processor::<
+                    alacritty_terminal::vte::ansi::StdSyncHandler,
+                >::new(),
+                output_prev_input_byte: None,
             };
 
             if !activation_script.is_empty() && no_task {
@@ -878,6 +886,9 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
+    output_parser:
+        alacritty_terminal::vte::ansi::Processor<alacritty_terminal::vte::ansi::StdSyncHandler>,
+    output_prev_input_byte: Option<u8>,
 }
 
 struct CopyTemplate {
@@ -1308,21 +1319,19 @@ impl Terminal {
         // the rendered output look ridiculous. To prevent this, we insert a CR (\r) before
         // each LF that didn't already have one. (Alacritty doesn't have a setting for this.)
         let mut converted = Vec::with_capacity(bytes.len());
-        let mut prev_byte = 0u8;
+        let mut previous_input_byte = self.output_prev_input_byte.unwrap_or_default();
         for &byte in bytes {
-            if byte == b'\n' && prev_byte != b'\r' {
+            if byte == b'\n' && previous_input_byte != b'\r' {
                 converted.push(b'\r');
             }
             converted.push(byte);
-            prev_byte = byte;
+            previous_input_byte = byte;
         }
+        self.output_prev_input_byte = Some(previous_input_byte);
 
-        let mut processor = alacritty_terminal::vte::ansi::Processor::<
-            alacritty_terminal::vte::ansi::StdSyncHandler,
-        >::new();
         {
             let mut term = self.term.lock();
-            processor.advance(&mut *term, &converted);
+            self.output_parser.advance(&mut *term, &converted);
         }
         cx.emit(Event::Wakeup);
     }
@@ -3133,6 +3142,94 @@ mod tests {
             "Bare CR should allow overwriting: got '{}'",
             text
         );
+    }
+
+    #[gpui::test]
+    async fn test_write_output_preserves_split_crlf_boundary(cx: &mut TestAppContext) {
+        let contiguous_terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let split_terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        contiguous_terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"line1\r\nline2\r\n", cx);
+        });
+        split_terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"line1\r", cx);
+            terminal.write_output(b"\nline2\r\n", cx);
+        });
+
+        let contiguous_content =
+            contiguous_terminal.update(cx, |terminal, _| terminal.get_content());
+        let split_content = split_terminal.update(cx, |terminal, _| terminal.get_content());
+
+        assert_eq!(
+            split_content, contiguous_content,
+            "Split CRLF output should match contiguous CRLF output"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_write_output_parses_split_osc_777_notification(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]777;notify;Build", cx);
+        });
+        cx.run_until_parked();
+
+        terminal.read_with(cx, |terminal, _| {
+            assert!(
+                !terminal.has_bell(),
+                "Incomplete OSC sequence should not emit a bell"
+            );
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b";Ready\x07", cx);
+        });
+        cx.run_until_parked();
+
+        terminal.read_with(cx, |terminal, _| {
+            assert!(
+                terminal.has_bell(),
+                "Split OSC 777 sequence should emit a bell after completion"
+            );
+        });
     }
 
     #[gpui::test]

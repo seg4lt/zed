@@ -96,11 +96,9 @@ Add environment variables to all terminal sessions:
 
 > **Tip:** Use `:` to separate multiple values in a single variable: `"PATH": "/custom/path:$PATH"`
 
-### Claude Code Notifications in Zed
+### Terminal OSC Notifications
 
-Zed's terminal supports Claude Code desktop notification escape sequences for terminal attention (including `OSC 9`, `OSC 99`, and `OSC 777`), but Claude Code's `auto` notification mode may not select a supported channel in Zed because `TERM_PROGRAM=zed`.
-
-If you want reliable notifications/attention in Zed, set Claude Code's `preferredNotifChannel` explicitly (for example: `ghostty`, `kitty`, `iterm2`, or `terminal_bell`).
+Zed's terminal handles desktop-notification OSC sequences for terminal attention, including `OSC 9`, `OSC 99`, and `OSC 777`.
 
 ### Python Virtual Environment Detection
 

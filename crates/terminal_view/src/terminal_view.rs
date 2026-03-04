@@ -484,7 +484,8 @@ impl TerminalView {
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
-        self.terminal.update(cx, |terminal, _| terminal.clear_bell());
+        self.terminal
+            .update(cx, |terminal, _| terminal.clear_bell());
         cx.emit(Event::Wakeup);
     }
 
@@ -2109,8 +2110,7 @@ mod tests {
                         command: Some("sh".to_string()),
                         args: vec![
                             "-c".to_string(),
-                            "printf '\\033]777;notify;Claude Code;Waiting for input\\a'"
-                                .to_string(),
+                            "printf '\\033]777;notify;Agent;Waiting for input\\a'".to_string(),
                         ],
                         ..Default::default()
                     },
