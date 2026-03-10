@@ -8,6 +8,7 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+cargo_feature_args=()
 
 # This must match the team in the provisioning profile.
 IDENTITY="Zed Industries, Inc."
@@ -46,6 +47,10 @@ do
 done
 
 shift $((OPTIND-1))
+
+if [[ -n "${ZED_BUNDLE_FEATURES:-}" ]]; then
+    cargo_feature_args=(--features "${ZED_BUNDLE_FEATURES}")
+fi
 
 
 # Get release channel
@@ -87,7 +92,7 @@ script/generate-licenses
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
+cargo build ${build_flag} --package zed --package cli --target $target_triple "${cargo_feature_args[@]}"
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 cargo build ${build_flag} --package remote_server --target $target_triple
@@ -100,7 +105,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root "${cargo_feature_args[@]}" | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd

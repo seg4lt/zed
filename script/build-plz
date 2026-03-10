@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+export ZED_BUNDLE_FEATURES="remote/build-remote-server-binary${ZED_BUNDLE_FEATURES:+ ${ZED_BUNDLE_FEATURES}}"
+
+if [[ $# -eq 0 ]]; then
+    exec ./script/bundle-mac aarch64-apple-darwin
+fi
+
+exec ./script/bundle-mac "$@"

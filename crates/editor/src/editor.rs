@@ -967,6 +967,8 @@ pub struct Editor {
     blink_manager: Entity<BlinkManager>,
     show_cursor_names: bool,
     hovered_cursors: HashMap<HoveredCursor, Task<()>>,
+    cursor_tail_states: HashMap<CursorTrailKey, CursorTrailState>,
+    last_cursor_tail_prune: Option<Instant>,
     pub show_local_selections: bool,
     mode: EditorMode,
     breadcrumbs_visibility: BreadcrumbsVisibility,
@@ -1305,6 +1307,39 @@ enum SelectionHistoryMode {
 struct HoveredCursor {
     replica_id: ReplicaId,
     selection_id: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CursorTrailSource {
+    Local,
+    Remote(ReplicaId),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CursorTrailKey {
+    pub source: CursorTrailSource,
+    pub selection_id: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct CursorTrailRect {
+    pub origin: gpui::Point<Pixels>,
+    pub size: Size<Pixels>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CursorTrailAnimationState {
+    pub from: CursorTrailRect,
+    pub to: CursorTrailRect,
+    pub started_at: Instant,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct CursorTrailState {
+    last_head: DisplayPoint,
+    last_rect: CursorTrailRect,
+    animation: Option<CursorTrailAnimationState>,
+    last_seen: Instant,
 }
 
 #[derive(Debug)]
@@ -2370,6 +2405,8 @@ impl Editor {
             style: None,
             show_cursor_names: false,
             hovered_cursors: HashMap::default(),
+            cursor_tail_states: HashMap::default(),
+            last_cursor_tail_prune: None,
             next_editor_action_id: EditorActionId::default(),
             editor_actions: Rc::default(),
             edit_predictions_hidden_for_vim_mode: false,
@@ -9402,6 +9439,198 @@ impl Editor {
             && self.focus_handle.is_focused(window)
     }
 
+    pub(crate) fn cursor_tail_state_max_age(duration: Duration) -> Duration {
+        // Keep state alive long enough to survive cursor blink-off phases, otherwise
+        // movement during blink invisibility can look like a cold start with no trail.
+        duration
+            .saturating_mul(2)
+            .max(Duration::from_millis(300))
+            .max(CURSOR_BLINK_INTERVAL + Duration::from_millis(100))
+    }
+
+    const CURSOR_TAIL_PRUNE_INTERVAL: Duration = Duration::from_millis(150);
+
+    fn cursor_tail_rebind_candidate_key(
+        states: &HashMap<CursorTrailKey, CursorTrailState>,
+        active_keys: &[CursorTrailKey],
+        key: CursorTrailKey,
+        head: DisplayPoint,
+        now: Instant,
+        max_age: Duration,
+    ) -> Option<CursorTrailKey> {
+        let mut best_candidate: Option<(CursorTrailKey, (u32, u32, Duration))> = None;
+        for (candidate_key, state) in states {
+            if candidate_key.source != key.source
+                || *candidate_key == key
+                || active_keys.contains(candidate_key)
+            {
+                continue;
+            }
+
+            let Some(age) = now.checked_duration_since(state.last_seen) else {
+                continue;
+            };
+            if age > max_age {
+                continue;
+            }
+
+            let score = (
+                state.last_head.row().0.abs_diff(head.row().0),
+                state.last_head.column().abs_diff(head.column()),
+                age,
+            );
+            if best_candidate
+                .as_ref()
+                .is_none_or(|(_, best_score)| score < *best_score)
+            {
+                best_candidate = Some((*candidate_key, score));
+            }
+        }
+        best_candidate.map(|(candidate_key, _)| candidate_key)
+    }
+
+    fn cursor_tail_interpolated_rect(
+        animation: CursorTrailAnimationState,
+        now: Instant,
+        duration: Duration,
+    ) -> CursorTrailRect {
+        if duration.is_zero() {
+            return animation.to;
+        }
+
+        let elapsed = now
+            .checked_duration_since(animation.started_at)
+            .unwrap_or_default();
+        let progress = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+        CursorTrailRect {
+            origin: point(
+                animation.from.origin.x
+                    + (animation.to.origin.x - animation.from.origin.x) * progress,
+                animation.from.origin.y
+                    + (animation.to.origin.y - animation.from.origin.y) * progress,
+            ),
+            size: size(
+                animation.from.size.width
+                    + (animation.to.size.width - animation.from.size.width) * progress,
+                animation.from.size.height
+                    + (animation.to.size.height - animation.from.size.height) * progress,
+            ),
+        }
+    }
+
+    fn update_cursor_tail_state(
+        state: &mut CursorTrailState,
+        head: DisplayPoint,
+        rect: CursorTrailRect,
+        now: Instant,
+        duration: Duration,
+    ) -> Option<CursorTrailAnimationState> {
+        let moved = state.last_head != head || state.last_rect.size != rect.size;
+        if moved {
+            let from = state
+                .animation
+                .and_then(|animation| {
+                    now.checked_duration_since(animation.started_at)
+                        .filter(|elapsed| *elapsed < duration)
+                        .map(|_| Self::cursor_tail_interpolated_rect(animation, now, duration))
+                })
+                .unwrap_or(state.last_rect);
+            state.animation = Some(CursorTrailAnimationState {
+                from,
+                to: rect,
+                started_at: now,
+            });
+            state.last_head = head;
+            state.last_rect = rect;
+        } else if state.last_rect.origin != rect.origin {
+            state.last_rect = rect;
+            state.animation = None;
+        }
+
+        state.last_seen = now;
+
+        let mut animation = state.animation;
+        if animation
+            .and_then(|animation| now.checked_duration_since(animation.started_at))
+            .is_none_or(|elapsed| elapsed >= duration)
+        {
+            state.animation = None;
+            animation = None;
+        }
+
+        animation
+    }
+
+    pub(crate) fn record_cursor_tail_animation(
+        &mut self,
+        key: CursorTrailKey,
+        active_keys: &[CursorTrailKey],
+        head: DisplayPoint,
+        rect: CursorTrailRect,
+        now: Instant,
+        duration: Duration,
+    ) -> Option<CursorTrailAnimationState> {
+        if let Some(state) = self.cursor_tail_states.get_mut(&key) {
+            return Self::update_cursor_tail_state(state, head, rect, now, duration);
+        }
+
+        let mut state = {
+            let max_age = Self::cursor_tail_state_max_age(duration);
+            let rebound_state = Self::cursor_tail_rebind_candidate_key(
+                &self.cursor_tail_states,
+                active_keys,
+                key,
+                head,
+                now,
+                max_age,
+            )
+            .and_then(|candidate_key| self.cursor_tail_states.remove(&candidate_key));
+
+            let Some(rebound_state) = rebound_state else {
+                self.cursor_tail_states.insert(
+                    key,
+                    CursorTrailState {
+                        last_head: head,
+                        last_rect: rect,
+                        animation: None,
+                        last_seen: now,
+                    },
+                );
+                return None;
+            };
+            rebound_state
+        };
+
+        let animation = Self::update_cursor_tail_state(&mut state, head, rect, now, duration);
+        self.cursor_tail_states.insert(key, state);
+        animation
+    }
+
+    pub(crate) fn prune_cursor_tail_states(&mut self, now: Instant, max_age: Duration) {
+        self.cursor_tail_states.retain(|_, state| {
+            now.checked_duration_since(state.last_seen)
+                .is_none_or(|age| age <= max_age)
+        });
+    }
+
+    pub(crate) fn maybe_prune_cursor_tail_states(&mut self, now: Instant, max_age: Duration) {
+        let should_prune = self
+            .last_cursor_tail_prune
+            .and_then(|last_prune| now.checked_duration_since(last_prune))
+            .is_none_or(|elapsed| elapsed >= Self::CURSOR_TAIL_PRUNE_INTERVAL);
+        if !should_prune {
+            return;
+        }
+
+        self.last_cursor_tail_prune = Some(now);
+        self.prune_cursor_tail_states(now, max_age);
+    }
+
+    pub(crate) fn clear_cursor_tail_states(&mut self) {
+        self.cursor_tail_states.clear();
+        self.last_cursor_tail_prune = None;
+    }
+
     pub fn set_show_cursor_when_unfocused(&mut self, is_enabled: bool, cx: &mut Context<Self>) {
         self.show_cursor_when_unfocused = is_enabled;
         cx.notify();
@@ -9775,6 +10004,9 @@ impl Editor {
                     BreadcrumbsVisibility::new(editor_settings.toolbar.breadcrumbs);
             }
             self.cursor_shape = editor_settings.cursor_shape.unwrap_or_default();
+            if !editor_settings.cursor_tail.enabled {
+                self.clear_cursor_tail_states();
+            }
         }
 
         if old_cursor_shape != self.cursor_shape {
@@ -11146,6 +11378,1013 @@ struct CompletionEdit {
     snippet: Option<Snippet>,
 }
 
+fn comment_delimiter_for_newline(
+    start_point: &Point,
+    buffer: &MultiBufferSnapshot,
+    language: &LanguageScope,
+) -> Option<Arc<str>> {
+    let delimiters = language.line_comment_prefixes();
+    let max_len_of_delimiter = delimiters.iter().map(|delimiter| delimiter.len()).max()?;
+    let (snapshot, range) = buffer.buffer_line_for_row(MultiBufferRow(start_point.row))?;
+
+    let num_of_whitespaces = snapshot
+        .chars_for_range(range.clone())
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let comment_candidate = snapshot
+        .chars_for_range(range.clone())
+        .skip(num_of_whitespaces)
+        .take(max_len_of_delimiter + 2)
+        .collect::<String>();
+    let (delimiter, trimmed_len, is_repl) = delimiters
+        .iter()
+        .filter_map(|delimiter| {
+            let prefix = delimiter.trim_end();
+            if comment_candidate.starts_with(prefix) {
+                let is_repl = if let Some(stripped_comment) = comment_candidate.strip_prefix(prefix)
+                {
+                    stripped_comment.starts_with(" %%")
+                } else {
+                    false
+                };
+                Some((delimiter, prefix.len(), is_repl))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(_, len, _)| *len)?;
+
+    if let Some(BlockCommentConfig {
+        start: block_start, ..
+    }) = language.block_comment()
+    {
+        let block_start_trimmed = block_start.trim_end();
+        if block_start_trimmed.starts_with(delimiter.trim_end()) {
+            let line_content = snapshot
+                .chars_for_range(range.clone())
+                .skip(num_of_whitespaces)
+                .take(block_start_trimmed.len())
+                .collect::<String>();
+
+            if line_content.starts_with(block_start_trimmed) {
+                return None;
+            }
+        }
+    }
+
+    let cursor_is_placed_after_comment_marker =
+        num_of_whitespaces + trimmed_len <= start_point.column as usize;
+    if cursor_is_placed_after_comment_marker {
+        if !is_repl {
+            return Some(delimiter.clone());
+        }
+
+        let line_content_after_cursor: String = snapshot
+            .chars_for_range(range)
+            .skip(start_point.column as usize)
+            .collect();
+
+        if line_content_after_cursor.trim().is_empty() {
+            return None;
+        } else {
+            return Some(delimiter.clone());
+        }
+    } else {
+        None
+    }
+}
+
+fn documentation_delimiter_for_newline(
+    start_point: &Point,
+    buffer: &MultiBufferSnapshot,
+    language: &LanguageScope,
+    newline_config: &mut NewlineConfig,
+) -> Option<Arc<str>> {
+    let BlockCommentConfig {
+        start: start_tag,
+        end: end_tag,
+        prefix: delimiter,
+        tab_size: len,
+    } = language.documentation_comment()?;
+    let is_within_block_comment = buffer
+        .language_scope_at(*start_point)
+        .is_some_and(|scope| scope.override_name() == Some("comment"));
+    if !is_within_block_comment {
+        return None;
+    }
+
+    let (snapshot, range) = buffer.buffer_line_for_row(MultiBufferRow(start_point.row))?;
+
+    let num_of_whitespaces = snapshot
+        .chars_for_range(range.clone())
+        .take_while(|c| c.is_whitespace())
+        .count();
+
+    // It is safe to use a column from MultiBufferPoint in context of a single buffer ranges, because we're only ever looking at a single line at a time.
+    let column = start_point.column;
+    let cursor_is_after_start_tag = {
+        let start_tag_len = start_tag.len();
+        let start_tag_line = snapshot
+            .chars_for_range(range.clone())
+            .skip(num_of_whitespaces)
+            .take(start_tag_len)
+            .collect::<String>();
+        if start_tag_line.starts_with(start_tag.as_ref()) {
+            num_of_whitespaces + start_tag_len <= column as usize
+        } else {
+            false
+        }
+    };
+
+    let cursor_is_after_delimiter = {
+        let delimiter_trim = delimiter.trim_end();
+        let delimiter_line = snapshot
+            .chars_for_range(range.clone())
+            .skip(num_of_whitespaces)
+            .take(delimiter_trim.len())
+            .collect::<String>();
+        if delimiter_line.starts_with(delimiter_trim) {
+            num_of_whitespaces + delimiter_trim.len() <= column as usize
+        } else {
+            false
+        }
+    };
+
+    let mut needs_extra_line = false;
+    let mut extra_line_additional_indent = IndentSize::spaces(0);
+
+    let cursor_is_before_end_tag_if_exists = {
+        let mut char_position = 0u32;
+        let mut end_tag_offset = None;
+
+        'outer: for chunk in snapshot.text_for_range(range) {
+            if let Some(byte_pos) = chunk.find(&**end_tag) {
+                let chars_before_match = chunk[..byte_pos].chars().count() as u32;
+                end_tag_offset = Some(char_position + chars_before_match);
+                break 'outer;
+            }
+            char_position += chunk.chars().count() as u32;
+        }
+
+        if let Some(end_tag_offset) = end_tag_offset {
+            let cursor_is_before_end_tag = column <= end_tag_offset;
+            if cursor_is_after_start_tag {
+                if cursor_is_before_end_tag {
+                    needs_extra_line = true;
+                }
+                let cursor_is_at_start_of_end_tag = column == end_tag_offset;
+                if cursor_is_at_start_of_end_tag {
+                    extra_line_additional_indent.len = *len;
+                }
+            }
+            cursor_is_before_end_tag
+        } else {
+            true
+        }
+    };
+
+    if (cursor_is_after_start_tag || cursor_is_after_delimiter)
+        && cursor_is_before_end_tag_if_exists
+    {
+        let additional_indent = if cursor_is_after_start_tag {
+            IndentSize::spaces(*len)
+        } else {
+            IndentSize::spaces(0)
+        };
+
+        *newline_config = NewlineConfig::Newline {
+            additional_indent,
+            extra_line_additional_indent: if needs_extra_line {
+                Some(extra_line_additional_indent)
+            } else {
+                None
+            },
+            prevent_auto_indent: true,
+        };
+        Some(delimiter.clone())
+    } else {
+        None
+    }
+}
+
+const ORDERED_LIST_MAX_MARKER_LEN: usize = 16;
+
+fn list_delimiter_for_newline(
+    start_point: &Point,
+    buffer: &MultiBufferSnapshot,
+    language: &LanguageScope,
+    newline_config: &mut NewlineConfig,
+) -> Option<Arc<str>> {
+    let (snapshot, range) = buffer.buffer_line_for_row(MultiBufferRow(start_point.row))?;
+
+    let num_of_whitespaces = snapshot
+        .chars_for_range(range.clone())
+        .take_while(|c| c.is_whitespace())
+        .count();
+
+    let task_list_entries: Vec<_> = language
+        .task_list()
+        .into_iter()
+        .flat_map(|config| {
+            config
+                .prefixes
+                .iter()
+                .map(|prefix| (prefix.as_ref(), config.continuation.as_ref()))
+        })
+        .collect();
+    let unordered_list_entries: Vec<_> = language
+        .unordered_list()
+        .iter()
+        .map(|marker| (marker.as_ref(), marker.as_ref()))
+        .collect();
+
+    let all_entries: Vec<_> = task_list_entries
+        .into_iter()
+        .chain(unordered_list_entries)
+        .collect();
+
+    if let Some(max_prefix_len) = all_entries.iter().map(|(p, _)| p.len()).max() {
+        let candidate: String = snapshot
+            .chars_for_range(range.clone())
+            .skip(num_of_whitespaces)
+            .take(max_prefix_len)
+            .collect();
+
+        if let Some((prefix, continuation)) = all_entries
+            .iter()
+            .filter(|(prefix, _)| candidate.starts_with(*prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            let end_of_prefix = num_of_whitespaces + prefix.len();
+            let cursor_is_after_prefix = end_of_prefix <= start_point.column as usize;
+            let has_content_after_marker = snapshot
+                .chars_for_range(range)
+                .skip(end_of_prefix)
+                .any(|c| !c.is_whitespace());
+
+            if has_content_after_marker && cursor_is_after_prefix {
+                return Some((*continuation).into());
+            }
+
+            if start_point.column as usize == end_of_prefix {
+                if num_of_whitespaces == 0 {
+                    *newline_config = NewlineConfig::ClearCurrentLine;
+                } else {
+                    *newline_config = NewlineConfig::UnindentCurrentLine {
+                        continuation: (*continuation).into(),
+                    };
+                }
+            }
+
+            return None;
+        }
+    }
+
+    let candidate: String = snapshot
+        .chars_for_range(range.clone())
+        .skip(num_of_whitespaces)
+        .take(ORDERED_LIST_MAX_MARKER_LEN)
+        .collect();
+
+    for ordered_config in language.ordered_list() {
+        let regex = match Regex::new(&ordered_config.pattern) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if let Some(captures) = regex.captures(&candidate) {
+            let full_match = captures.get(0)?;
+            let marker_len = full_match.len();
+            let end_of_prefix = num_of_whitespaces + marker_len;
+            let cursor_is_after_prefix = end_of_prefix <= start_point.column as usize;
+
+            let has_content_after_marker = snapshot
+                .chars_for_range(range)
+                .skip(end_of_prefix)
+                .any(|c| !c.is_whitespace());
+
+            if has_content_after_marker && cursor_is_after_prefix {
+                let number: u32 = captures.get(1)?.as_str().parse().ok()?;
+                let continuation = ordered_config
+                    .format
+                    .replace("{1}", &(number + 1).to_string());
+                return Some(continuation.into());
+            }
+
+            if start_point.column as usize == end_of_prefix {
+                let continuation = ordered_config.format.replace("{1}", "1");
+                if num_of_whitespaces == 0 {
+                    *newline_config = NewlineConfig::ClearCurrentLine;
+                } else {
+                    *newline_config = NewlineConfig::UnindentCurrentLine {
+                        continuation: continuation.into(),
+                    };
+                }
+            }
+
+            return None;
+        }
+    }
+
+    None
+}
+
+fn is_list_prefix_row(
+    row: MultiBufferRow,
+    buffer: &MultiBufferSnapshot,
+    language: &LanguageScope,
+) -> bool {
+    let Some((snapshot, range)) = buffer.buffer_line_for_row(row) else {
+        return false;
+    };
+
+    let num_of_whitespaces = snapshot
+        .chars_for_range(range.clone())
+        .take_while(|c| c.is_whitespace())
+        .count();
+
+    let task_list_prefixes: Vec<_> = language
+        .task_list()
+        .into_iter()
+        .flat_map(|config| {
+            config
+                .prefixes
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let unordered_list_markers: Vec<_> = language
+        .unordered_list()
+        .iter()
+        .map(|marker| marker.as_ref())
+        .collect();
+    let all_prefixes: Vec<_> = task_list_prefixes
+        .into_iter()
+        .chain(unordered_list_markers)
+        .collect();
+    if let Some(max_prefix_len) = all_prefixes.iter().map(|p| p.len()).max() {
+        let candidate: String = snapshot
+            .chars_for_range(range.clone())
+            .skip(num_of_whitespaces)
+            .take(max_prefix_len)
+            .collect();
+        if all_prefixes
+            .iter()
+            .any(|prefix| candidate.starts_with(*prefix))
+        {
+            return true;
+        }
+    }
+
+    let ordered_list_candidate: String = snapshot
+        .chars_for_range(range)
+        .skip(num_of_whitespaces)
+        .take(ORDERED_LIST_MAX_MARKER_LEN)
+        .collect();
+    for ordered_config in language.ordered_list() {
+        let regex = match Regex::new(&ordered_config.pattern) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(captures) = regex.captures(&ordered_list_candidate) {
+            return captures.get(0).is_some();
+        }
+    }
+
+    false
+}
+
+#[derive(Debug)]
+enum NewlineConfig {
+    /// Insert newline with optional additional indent and optional extra blank line
+    Newline {
+        additional_indent: IndentSize,
+        extra_line_additional_indent: Option<IndentSize>,
+        prevent_auto_indent: bool,
+    },
+    /// Clear the current line
+    ClearCurrentLine,
+    /// Unindent the current line and add continuation
+    UnindentCurrentLine { continuation: Arc<str> },
+}
+
+impl NewlineConfig {
+    fn has_extra_line(&self) -> bool {
+        matches!(
+            self,
+            Self::Newline {
+                extra_line_additional_indent: Some(_),
+                ..
+            }
+        )
+    }
+
+    fn insert_extra_newline_brackets(
+        buffer: &MultiBufferSnapshot,
+        range: Range<MultiBufferOffset>,
+        language: &language::LanguageScope,
+    ) -> bool {
+        let leading_whitespace_len = buffer
+            .reversed_chars_at(range.start)
+            .take_while(|c| c.is_whitespace() && *c != '\n')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        let trailing_whitespace_len = buffer
+            .chars_at(range.end)
+            .take_while(|c| c.is_whitespace() && *c != '\n')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        let range = range.start - leading_whitespace_len..range.end + trailing_whitespace_len;
+
+        language.brackets().any(|(pair, enabled)| {
+            let pair_start = pair.start.trim_end();
+            let pair_end = pair.end.trim_start();
+
+            enabled
+                && pair.newline
+                && buffer.contains_str_at(range.end, pair_end)
+                && buffer.contains_str_at(
+                    range.start.saturating_sub_usize(pair_start.len()),
+                    pair_start,
+                )
+        })
+    }
+
+    fn insert_extra_newline_tree_sitter(
+        buffer: &MultiBufferSnapshot,
+        range: Range<MultiBufferOffset>,
+    ) -> bool {
+        let (buffer, range) = match buffer
+            .range_to_buffer_ranges(range.start..range.end)
+            .as_slice()
+        {
+            [(buffer_snapshot, range, _)] => (buffer_snapshot.clone(), range.clone()),
+            _ => return false,
+        };
+        let pair = {
+            let mut result: Option<BracketMatch<usize>> = None;
+
+            for pair in buffer
+                .all_bracket_ranges(range.start.0..range.end.0)
+                .filter(move |pair| {
+                    pair.open_range.start <= range.start.0 && pair.close_range.end >= range.end.0
+                })
+            {
+                let len = pair.close_range.end - pair.open_range.start;
+
+                if let Some(existing) = &result {
+                    let existing_len = existing.close_range.end - existing.open_range.start;
+                    if len > existing_len {
+                        continue;
+                    }
+                }
+
+                result = Some(pair);
+            }
+
+            result
+        };
+        let Some(pair) = pair else {
+            return false;
+        };
+        pair.newline_only
+            && buffer
+                .chars_for_range(pair.open_range.end..range.start.0)
+                .chain(buffer.chars_for_range(range.end.0..pair.close_range.start))
+                .all(|c| c.is_whitespace() && c != '\n')
+    }
+}
+
+fn char_len_with_expanded_tabs(offset: usize, text: &str, tab_size: NonZeroU32) -> usize {
+    let tab_size = tab_size.get() as usize;
+    let mut width = offset;
+
+    for ch in text.chars() {
+        width += if ch == '\t' {
+            tab_size - (width % tab_size)
+        } else {
+            1
+        };
+    }
+
+    width - offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_string_size_with_expanded_tabs() {
+        let nz = |val| NonZeroU32::new(val).unwrap();
+        assert_eq!(char_len_with_expanded_tabs(0, "", nz(4)), 0);
+        assert_eq!(char_len_with_expanded_tabs(0, "hello", nz(4)), 5);
+        assert_eq!(char_len_with_expanded_tabs(0, "\thello", nz(4)), 9);
+        assert_eq!(char_len_with_expanded_tabs(0, "abc\tab", nz(4)), 6);
+        assert_eq!(char_len_with_expanded_tabs(0, "hello\t", nz(4)), 8);
+        assert_eq!(char_len_with_expanded_tabs(0, "\t\t", nz(8)), 16);
+        assert_eq!(char_len_with_expanded_tabs(0, "x\t", nz(8)), 8);
+        assert_eq!(char_len_with_expanded_tabs(7, "x\t", nz(8)), 9);
+    }
+
+    #[test]
+    fn test_cursor_tail_rebind_candidate_uses_closest_recent_state() {
+        let now = Instant::now();
+        let desired_key = CursorTrailKey {
+            source: CursorTrailSource::Local,
+            selection_id: 99,
+        };
+        let desired_head = DisplayPoint::new(DisplayRow(7), 3);
+        let mut states = HashMap::default();
+        states.insert(
+            CursorTrailKey {
+                source: CursorTrailSource::Local,
+                selection_id: 1,
+            },
+            CursorTrailState {
+                last_head: DisplayPoint::new(DisplayRow(10), 2),
+                last_rect: CursorTrailRect {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(10.0), px(20.0)),
+                },
+                animation: None,
+                last_seen: now - Duration::from_millis(40),
+            },
+        );
+        states.insert(
+            CursorTrailKey {
+                source: CursorTrailSource::Local,
+                selection_id: 2,
+            },
+            CursorTrailState {
+                last_head: DisplayPoint::new(DisplayRow(7), 2),
+                last_rect: CursorTrailRect {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(10.0), px(20.0)),
+                },
+                animation: None,
+                last_seen: now - Duration::from_millis(20),
+            },
+        );
+        states.insert(
+            CursorTrailKey {
+                source: CursorTrailSource::Remote(ReplicaId::default()),
+                selection_id: 3,
+            },
+            CursorTrailState {
+                last_head: desired_head,
+                last_rect: CursorTrailRect {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(10.0), px(20.0)),
+                },
+                animation: None,
+                last_seen: now - Duration::from_millis(10),
+            },
+        );
+
+        let candidate = Editor::cursor_tail_rebind_candidate_key(
+            &states,
+            &[],
+            desired_key,
+            desired_head,
+            now,
+            Duration::from_millis(60),
+        );
+
+        assert_eq!(
+            candidate,
+            Some(CursorTrailKey {
+                source: CursorTrailSource::Local,
+                selection_id: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_cursor_tail_interpolation_uses_elapsed_progress() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(100);
+        let animation = CursorTrailAnimationState {
+            from: CursorTrailRect {
+                origin: point(px(10.0), px(20.0)),
+                size: size(px(12.0), px(24.0)),
+            },
+            to: CursorTrailRect {
+                origin: point(px(30.0), px(40.0)),
+                size: size(px(20.0), px(30.0)),
+            },
+            started_at: now - Duration::from_millis(50),
+        };
+
+        let interpolated = Editor::cursor_tail_interpolated_rect(animation, now, duration);
+        assert!((interpolated.origin.x - px(20.0)).abs() < px(0.01));
+        assert!((interpolated.origin.y - px(30.0)).abs() < px(0.01));
+        assert!((interpolated.size.width - px(16.0)).abs() < px(0.01));
+        assert!((interpolated.size.height - px(27.0)).abs() < px(0.01));
+    }
+
+    #[test]
+    fn test_cursor_tail_rebind_skips_current_frame_active_keys() {
+        let now = Instant::now();
+        let existing_key = CursorTrailKey {
+            source: CursorTrailSource::Local,
+            selection_id: 1,
+        };
+        let desired_key = CursorTrailKey {
+            source: CursorTrailSource::Local,
+            selection_id: 99,
+        };
+
+        let mut states = HashMap::default();
+        states.insert(
+            existing_key,
+            CursorTrailState {
+                last_head: DisplayPoint::new(DisplayRow(7), 3),
+                last_rect: CursorTrailRect {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(10.0), px(20.0)),
+                },
+                animation: None,
+                last_seen: now - Duration::from_millis(20),
+            },
+        );
+
+        let active_keys = [existing_key, desired_key];
+
+        let candidate = Editor::cursor_tail_rebind_candidate_key(
+            &states,
+            &active_keys,
+            desired_key,
+            DisplayPoint::new(DisplayRow(7), 3),
+            now,
+            Duration::from_millis(60),
+        );
+
+        assert_eq!(candidate, None);
+    }
+
+    #[test]
+    fn test_cursor_tail_state_max_age_survives_blink_off_window() {
+        let short_animation_duration = Duration::from_millis(90);
+        let max_age = Editor::cursor_tail_state_max_age(short_animation_duration);
+        assert!(max_age >= CURSOR_BLINK_INTERVAL + Duration::from_millis(100));
+    }
+}
+
+/// Tokenizes a string into runs of text that should stick together, or that is whitespace.
+struct WordBreakingTokenizer<'a> {
+    input: &'a str,
+}
+
+impl<'a> WordBreakingTokenizer<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input }
+    }
+}
+
+fn is_char_ideographic(ch: char) -> bool {
+    use unicode_script::Script::*;
+    use unicode_script::UnicodeScript;
+    matches!(ch.script(), Han | Tangut | Yi)
+}
+
+fn is_grapheme_ideographic(text: &str) -> bool {
+    text.chars().any(is_char_ideographic)
+}
+
+fn is_grapheme_whitespace(text: &str) -> bool {
+    text.chars().any(|x| x.is_whitespace())
+}
+
+fn should_stay_with_preceding_ideograph(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '。' | '、' | '，' | '？' | '！' | '：' | '；' | '…'))
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum WordBreakToken<'a> {
+    Word { token: &'a str, grapheme_len: usize },
+    InlineWhitespace { token: &'a str, grapheme_len: usize },
+    Newline,
+}
+
+impl<'a> Iterator for WordBreakingTokenizer<'a> {
+    /// Yields a span, the count of graphemes in the token, and whether it was
+    /// whitespace. Note that it also breaks at word boundaries.
+    type Item = WordBreakToken<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use unicode_segmentation::UnicodeSegmentation;
+        if self.input.is_empty() {
+            return None;
+        }
+
+        let mut iter = self.input.graphemes(true).peekable();
+        let mut offset = 0;
+        let mut grapheme_len = 0;
+        if let Some(first_grapheme) = iter.next() {
+            let is_newline = first_grapheme == "\n";
+            let is_whitespace = is_grapheme_whitespace(first_grapheme);
+            offset += first_grapheme.len();
+            grapheme_len += 1;
+            if is_grapheme_ideographic(first_grapheme) && !is_whitespace {
+                if let Some(grapheme) = iter.peek().copied()
+                    && should_stay_with_preceding_ideograph(grapheme)
+                {
+                    offset += grapheme.len();
+                    grapheme_len += 1;
+                }
+            } else {
+                let mut words = self.input[offset..].split_word_bound_indices().peekable();
+                let mut next_word_bound = words.peek().copied();
+                if next_word_bound.is_some_and(|(i, _)| i == 0) {
+                    next_word_bound = words.next();
+                }
+                while let Some(grapheme) = iter.peek().copied() {
+                    if next_word_bound.is_some_and(|(i, _)| i == offset) {
+                        break;
+                    };
+                    if is_grapheme_whitespace(grapheme) != is_whitespace
+                        || (grapheme == "\n") != is_newline
+                    {
+                        break;
+                    };
+                    offset += grapheme.len();
+                    grapheme_len += 1;
+                    iter.next();
+                }
+            }
+            let token = &self.input[..offset];
+            self.input = &self.input[offset..];
+            if token == "\n" {
+                Some(WordBreakToken::Newline)
+            } else if is_whitespace {
+                Some(WordBreakToken::InlineWhitespace {
+                    token,
+                    grapheme_len,
+                })
+            } else {
+                Some(WordBreakToken::Word {
+                    token,
+                    grapheme_len,
+                })
+            }
+        } else {
+            None
+        }
+    }
+}
+
+#[test]
+fn test_word_breaking_tokenizer() {
+    let tests: &[(&str, &[WordBreakToken<'static>])] = &[
+        ("", &[]),
+        ("  ", &[whitespace("  ", 2)]),
+        ("Ʒ", &[word("Ʒ", 1)]),
+        ("Ǽ", &[word("Ǽ", 1)]),
+        ("⋑", &[word("⋑", 1)]),
+        ("⋑⋑", &[word("⋑⋑", 2)]),
+        (
+            "原理，进而",
+            &[word("原", 1), word("理，", 2), word("进", 1), word("而", 1)],
+        ),
+        (
+            "hello world",
+            &[word("hello", 5), whitespace(" ", 1), word("world", 5)],
+        ),
+        (
+            "hello, world",
+            &[word("hello,", 6), whitespace(" ", 1), word("world", 5)],
+        ),
+        (
+            "  hello world",
+            &[
+                whitespace("  ", 2),
+                word("hello", 5),
+                whitespace(" ", 1),
+                word("world", 5),
+            ],
+        ),
+        (
+            "这是什么 \n 钢笔",
+            &[
+                word("这", 1),
+                word("是", 1),
+                word("什", 1),
+                word("么", 1),
+                whitespace(" ", 1),
+                newline(),
+                whitespace(" ", 1),
+                word("钢", 1),
+                word("笔", 1),
+            ],
+        ),
+        (" mutton", &[whitespace(" ", 1), word("mutton", 6)]),
+    ];
+
+    fn word(token: &'static str, grapheme_len: usize) -> WordBreakToken<'static> {
+        WordBreakToken::Word {
+            token,
+            grapheme_len,
+        }
+    }
+
+    fn whitespace(token: &'static str, grapheme_len: usize) -> WordBreakToken<'static> {
+        WordBreakToken::InlineWhitespace {
+            token,
+            grapheme_len,
+        }
+    }
+
+    fn newline() -> WordBreakToken<'static> {
+        WordBreakToken::Newline
+    }
+
+    for (input, result) in tests {
+        assert_eq!(
+            WordBreakingTokenizer::new(input)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            *result,
+        );
+    }
+}
+
+fn wrap_with_prefix(
+    first_line_prefix: String,
+    subsequent_lines_prefix: String,
+    unwrapped_text: String,
+    wrap_column: usize,
+    tab_size: NonZeroU32,
+    preserve_existing_whitespace: bool,
+) -> String {
+    let first_line_prefix_len = char_len_with_expanded_tabs(0, &first_line_prefix, tab_size);
+    let subsequent_lines_prefix_len =
+        char_len_with_expanded_tabs(0, &subsequent_lines_prefix, tab_size);
+    let mut wrapped_text = String::new();
+    let mut current_line = first_line_prefix;
+    let mut is_first_line = true;
+
+    let tokenizer = WordBreakingTokenizer::new(&unwrapped_text);
+    let mut current_line_len = first_line_prefix_len;
+    let mut in_whitespace = false;
+    for token in tokenizer {
+        let have_preceding_whitespace = in_whitespace;
+        match token {
+            WordBreakToken::Word {
+                token,
+                grapheme_len,
+            } => {
+                in_whitespace = false;
+                let current_prefix_len = if is_first_line {
+                    first_line_prefix_len
+                } else {
+                    subsequent_lines_prefix_len
+                };
+                if current_line_len + grapheme_len > wrap_column
+                    && current_line_len != current_prefix_len
+                {
+                    wrapped_text.push_str(current_line.trim_end());
+                    wrapped_text.push('\n');
+                    is_first_line = false;
+                    current_line = subsequent_lines_prefix.clone();
+                    current_line_len = subsequent_lines_prefix_len;
+                }
+                current_line.push_str(token);
+                current_line_len += grapheme_len;
+            }
+            WordBreakToken::InlineWhitespace {
+                mut token,
+                mut grapheme_len,
+            } => {
+                in_whitespace = true;
+                if have_preceding_whitespace && !preserve_existing_whitespace {
+                    continue;
+                }
+                if !preserve_existing_whitespace {
+                    // Keep a single whitespace grapheme as-is
+                    if let Some(first) =
+                        unicode_segmentation::UnicodeSegmentation::graphemes(token, true).next()
+                    {
+                        token = first;
+                    } else {
+                        token = " ";
+                    }
+                    grapheme_len = 1;
+                }
+                let current_prefix_len = if is_first_line {
+                    first_line_prefix_len
+                } else {
+                    subsequent_lines_prefix_len
+                };
+                if current_line_len + grapheme_len > wrap_column {
+                    wrapped_text.push_str(current_line.trim_end());
+                    wrapped_text.push('\n');
+                    is_first_line = false;
+                    current_line = subsequent_lines_prefix.clone();
+                    current_line_len = subsequent_lines_prefix_len;
+                } else if current_line_len != current_prefix_len || preserve_existing_whitespace {
+                    current_line.push_str(token);
+                    current_line_len += grapheme_len;
+                }
+            }
+            WordBreakToken::Newline => {
+                in_whitespace = true;
+                let current_prefix_len = if is_first_line {
+                    first_line_prefix_len
+                } else {
+                    subsequent_lines_prefix_len
+                };
+                if preserve_existing_whitespace {
+                    wrapped_text.push_str(current_line.trim_end());
+                    wrapped_text.push('\n');
+                    is_first_line = false;
+                    current_line = subsequent_lines_prefix.clone();
+                    current_line_len = subsequent_lines_prefix_len;
+                } else if have_preceding_whitespace {
+                    continue;
+                } else if current_line_len + 1 > wrap_column
+                    && current_line_len != current_prefix_len
+                {
+                    wrapped_text.push_str(current_line.trim_end());
+                    wrapped_text.push('\n');
+                    is_first_line = false;
+                    current_line = subsequent_lines_prefix.clone();
+                    current_line_len = subsequent_lines_prefix_len;
+                } else if current_line_len != current_prefix_len {
+                    current_line.push(' ');
+                    current_line_len += 1;
+                }
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        wrapped_text.push_str(&current_line);
+    }
+    wrapped_text
+}
+
+#[test]
+fn test_wrap_with_prefix() {
+    assert_eq!(
+        wrap_with_prefix(
+            "# ".to_string(),
+            "# ".to_string(),
+            "abcdefg".to_string(),
+            4,
+            NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "# abcdefg"
+    );
+    assert_eq!(
+        wrap_with_prefix(
+            "".to_string(),
+            "".to_string(),
+            "\thello world".to_string(),
+            8,
+            NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "hello\nworld"
+    );
+    assert_eq!(
+        wrap_with_prefix(
+            "// ".to_string(),
+            "// ".to_string(),
+            "xx \nyy zz aa bb cc".to_string(),
+            12,
+            NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "// xx yy zz\n// aa bb cc"
+    );
+    assert_eq!(
+        wrap_with_prefix(
+            String::new(),
+            String::new(),
+            "这是什么 \n 钢笔".to_string(),
+            3,
+            NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "这是什\n么 钢\n笔"
+    );
+    assert_eq!(
+        wrap_with_prefix(
+            String::new(),
+            String::new(),
+            format!("foo{}bar", '\u{2009}'), // thin space
+            80,
+            NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        format!("foo{}bar", '\u{2009}')
+    );
+}
 pub trait CollaborationHub {
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator>;
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex>;

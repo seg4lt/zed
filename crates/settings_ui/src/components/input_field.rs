@@ -25,6 +25,7 @@ pub struct SettingsInputField {
     action_slot: Option<AnyElement>,
     color: Option<Color>,
     aria_label: Option<SharedString>,
+    min_width_px: Option<f32>,
 }
 
 impl SettingsInputField {
@@ -49,6 +50,7 @@ impl SettingsInputField {
             action_slot: None,
             color: None,
             aria_label: None,
+            min_width_px: None,
         }
     }
 
@@ -114,6 +116,11 @@ impl SettingsInputField {
     /// Defaults to the placeholder text, if any.
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
+        self
+    }
+
+    pub fn with_min_width_px(mut self, min_width_px: f32) -> Self {
+        self.min_width_px = Some(min_width_px);
         self
     }
 }
@@ -202,6 +209,7 @@ impl RenderOnce for SettingsInputField {
 
         let clear_on_confirm = self.clear_on_confirm;
         let clear_on_confirm_for_button = self.clear_on_confirm;
+        let min_width_px = self.min_width_px;
 
         let display_confirm_button = self.display_confirm_button;
         let display_clear_button = self.display_clear_button;
@@ -251,7 +259,10 @@ impl RenderOnce for SettingsInputField {
             .py_1()
             .px_2()
             .h_8()
-            .min_w_64()
+            .when_some(min_width_px, |this, min_width_px| {
+                this.min_w(gpui::px(min_width_px))
+            })
+            .when(min_width_px.is_none(), |this| this.min_w_64())
             .rounded_md()
             .border_1()
             .border_color(theme_colors.border)
