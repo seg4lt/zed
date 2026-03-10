@@ -2,14 +2,15 @@ use crate::{
     ActiveDiagnostic, BUFFER_HEADER_PADDING, BlockId, CURSORS_VISIBLE_FOR, ChunkRendererContext,
     ChunkReplacement, CodeActionSource, ColumnarMode, ConflictsOurs, ConflictsOursMarker,
     ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker, ContextMenuPlacement, CursorShape,
-    CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction,
-    Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT,
-    FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput, HoveredCursor,
-    InlayHintRefreshReason, JumpData, LineDown, LineHighlight, LineUp, MAX_LINE_LEN,
-    MINIMAP_FONT_SIZE, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, PageDown, PageUp,
-    PhantomBreakpointIndicator, PhantomDiffReviewIndicator, Point, RowExt, RowRangeExt,
-    SelectPhase, Selection, SelectionDragState, SelectionEffects, SizingBehavior, SoftWrap,
-    StickyHeaderExcerpt, ToPoint, ToggleFold, ToggleFoldAll,
+    CursorTrailAnimationState, CursorTrailKey, CursorTrailRect, CursorTrailSource, CustomBlockId,
+    DisplayDiffHunk, DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction, Editor, EditorMode,
+    EditorSettings, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock,
+    GutterDimensions, HalfPageDown, HalfPageUp, HandleInput, HoveredCursor, InlayHintRefreshReason,
+    JumpData, LineDown, LineHighlight, LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE,
+    MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, PageDown, PageUp, PhantomBreakpointIndicator,
+    PhantomDiffReviewIndicator, Point, RowExt, RowRangeExt, SelectPhase, Selection,
+    SelectionDragState, SelectionEffects, SizingBehavior, SoftWrap, StickyHeaderExcerpt, ToPoint,
+    ToggleFold, ToggleFoldAll,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     display_map::{
@@ -17,9 +18,9 @@ use crate::{
         HighlightKey, HighlightedChunk, ToDisplayPoint,
     },
     editor_settings::{
-        CurrentLineHighlight, DocumentColorsRenderMode, DoubleClickInMultibuffer, Minimap,
-        MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes,
-        ScrollbarDiagnostics, ShowMinimap,
+        CurrentLineHighlight, CursorTailSettings, DocumentColorsRenderMode,
+        DoubleClickInMultibuffer, Minimap, MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine,
+        ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
@@ -111,6 +112,8 @@ struct LineHighlightSpec {
 
 #[derive(Debug)]
 struct SelectionLayout {
+    selection_id: usize,
+    cursor_source: CursorTrailSource,
     head: DisplayPoint,
     cursor_shape: CursorShape,
     is_newest: bool,
@@ -133,6 +136,7 @@ impl SelectionLayout {
         line_mode: bool,
         cursor_offset: bool,
         cursor_shape: CursorShape,
+        cursor_source: CursorTrailSource,
         map: &DisplaySnapshot,
         is_newest: bool,
         is_local: bool,
@@ -173,6 +177,8 @@ impl SelectionLayout {
         }
 
         Self {
+            selection_id: selection.id,
+            cursor_source,
             head,
             cursor_shape,
             is_newest,
@@ -1579,6 +1585,7 @@ impl EditorElement {
                         editor.selections.line_mode(),
                         editor.cursor_offset_on_selection,
                         editor.cursor_shape,
+                        CursorTrailSource::Local,
                         &snapshot.display_snapshot,
                         is_newest,
                         editor.leader_id.is_none(),
@@ -1626,6 +1633,7 @@ impl EditorElement {
                         false,
                         editor.cursor_offset_on_selection,
                         CursorShape::Bar,
+                        CursorTrailSource::Local,
                         &snapshot.display_snapshot,
                         false,
                         false,
@@ -1690,6 +1698,7 @@ impl EditorElement {
                             selection.line_mode,
                             editor.cursor_offset_on_selection,
                             selection.cursor_shape,
+                            CursorTrailSource::Remote(selection.replica_id),
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1710,6 +1719,7 @@ impl EditorElement {
                             line_mode,
                             cursor_offset_on_selection,
                             cursor_shape,
+                            CursorTrailSource::Local,
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1801,14 +1811,44 @@ impl EditorElement {
             let mut cursors = Vec::new();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
+            let cursor_tail_settings = EditorSettings::get_global(cx).cursor_tail;
+            let cursor_tail_duration = Duration::from_millis(cursor_tail_settings.duration_ms.0);
+            let viewport_world_origin = point(
+                scroll_pixel_position.x.into(),
+                (scroll_position.y * ScrollPixelOffset::from(line_height)).into(),
+            );
+            let now = Instant::now();
+            let mut active_cursor_tail_keys: SmallVec<[CursorTrailKey; 8]> = SmallVec::new();
+            if cursor_tail_settings.enabled {
+                for (_, selections) in selections {
+                    for selection in selections {
+                        if Self::should_show_cursor_tail(
+                            selection.cursor_shape,
+                            cursor_tail_settings,
+                        ) {
+                            active_cursor_tail_keys.push(CursorTrailKey {
+                                source: selection.cursor_source,
+                                selection_id: selection.selection_id,
+                            });
+                        }
+                    }
+                }
+            }
 
             for (player_color, selections) in selections {
                 for selection in selections {
                     let cursor_position = selection.head;
+                    let should_show_trail =
+                        Self::should_show_cursor_tail(selection.cursor_shape, cursor_tail_settings);
+                    let hide_local_cursor_body = selection.is_local && !show_local_cursors;
 
                     let in_range = visible_display_row_range.contains(&cursor_position.row());
-                    if (selection.is_local && !show_local_cursors)
-                        || !in_range
+                    if (!Self::should_layout_cursor(
+                        selection.is_local,
+                        show_local_cursors,
+                        selection.cursor_shape,
+                        cursor_tail_settings,
+                    )) || !in_range
                         || row_block_types.get(&cursor_position.row()) == Some(&true)
                     {
                         continue;
@@ -1836,7 +1876,9 @@ impl EditorElement {
                         .iter()
                         .any(|range| range.start <= cursor_position && cursor_position < range.end);
 
-                    if selection.cursor_shape == CursorShape::Block && !is_cursor_in_redacted_range
+                    if selection.cursor_shape == CursorShape::Block
+                        && !is_cursor_in_redacted_range
+                        && !hide_local_cursor_body
                     {
                         if let Some(text) = snapshot.grapheme_at(cursor_position).or_else(|| {
                             if snapshot.is_empty() {
@@ -1893,10 +1935,16 @@ impl EditorElement {
                         }
                     }
 
-                    let x = cursor_character_x - scroll_pixel_position.x.into();
-                    let y = ((cursor_position.row().as_f64() - scroll_position.y)
+                    let world_x = cursor_character_x;
+                    let world_y = (cursor_position.row().as_f64()
                         * ScrollPixelOffset::from(line_height))
                     .into();
+                    let cursor_origin = point(
+                        world_x - viewport_world_origin.x,
+                        world_y - viewport_world_origin.y,
+                    );
+                    let x = cursor_origin.x;
+                    let y = cursor_origin.y;
                     if selection.is_newest {
                         editor.pixel_position_of_newest_cursor = Some(point(
                             text_hitbox.origin.x + x + block_width / 2.,
@@ -1932,23 +1980,67 @@ impl EditorElement {
                         }
                     }
 
+                    let mut trail = None;
+                    if should_show_trail {
+                        let key = CursorTrailKey {
+                            source: selection.cursor_source,
+                            selection_id: selection.selection_id,
+                        };
+                        let rect = CursorTrailRect {
+                            origin: point(world_x, world_y),
+                            size: size(block_width, line_height),
+                        };
+                        if let Some(animation) = editor.record_cursor_tail_animation(
+                            key,
+                            &active_cursor_tail_keys,
+                            cursor_position,
+                            rect,
+                            now,
+                            cursor_tail_duration,
+                        ) {
+                            let trail_color = Self::cursor_tail_color(
+                                selection.cursor_source,
+                                player_color.cursor,
+                                cursor_tail_settings,
+                            );
+                            trail = Self::layout_cursor_tail(
+                                animation,
+                                now,
+                                cursor_tail_settings,
+                                trail_color,
+                                viewport_world_origin,
+                            );
+                        }
+                    }
+
                     let mut cursor = CursorLayout {
                         color: player_color.cursor,
                         block_width,
-                        origin: point(x, y),
+                        origin: cursor_origin,
                         line_height,
                         shape: selection.cursor_shape,
+                        trail,
                         block_text,
+                        show_body: !hide_local_cursor_body,
                         cursor_name: None,
                     };
-                    let cursor_name = selection.user_name.clone().map(|name| CursorName {
-                        string: name,
-                        color: self.style.background,
-                        is_top_row: cursor_position.row().0 == 0,
-                    });
+                    let cursor_name = if hide_local_cursor_body {
+                        None
+                    } else {
+                        selection.user_name.clone().map(|name| CursorName {
+                            string: name,
+                            color: self.style.background,
+                            is_top_row: cursor_position.row().0 == 0,
+                        })
+                    };
                     cursor.layout(content_origin, cursor_name, window, cx);
                     cursors.push(cursor);
                 }
+            }
+
+            if cursor_tail_settings.enabled {
+                let max_age = Editor::cursor_tail_state_max_age(cursor_tail_duration);
+                editor.maybe_prune_cursor_tail_states(now, max_age);
             }
 
             cursors
@@ -6821,9 +6913,231 @@ impl EditorElement {
         }
     }
 
+    fn cursor_tail_mix(a: f32, b: f32, t: f32) -> f32 {
+        a * (1.0 - t) + b * t
+    }
+
+    fn cursor_tail_quantized_progress(elapsed: Duration, duration: Duration) -> f32 {
+        if duration.is_zero() {
+            return 1.0;
+        }
+        if elapsed >= duration {
+            return 1.0;
+        }
+
+        const CURSOR_TAIL_TARGET_FPS: f32 = 60.0;
+        let quantized_elapsed_seconds =
+            (elapsed.as_secs_f32() * CURSOR_TAIL_TARGET_FPS).floor() / CURSOR_TAIL_TARGET_FPS;
+        (quantized_elapsed_seconds / duration.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    fn cursor_tail_smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+        if (edge0 - edge1).abs() <= f32::EPSILON {
+            return if value < edge0 { 0.0 } else { 1.0 };
+        }
+        let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    fn cursor_tail_ease_out_circ(value: f32) -> f32 {
+        let value = value.clamp(0.0, 1.0);
+        (1.0 - (value - 1.0).powi(2)).max(0.0).sqrt()
+    }
+
+    fn cursor_tail_mix_point(
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+        t: f32,
+    ) -> gpui::Point<Pixels> {
+        point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+    }
+
+    fn cursor_tail_is_top_right_leading(
+        current_top_left: gpui::Point<Pixels>,
+        previous_top_left: gpui::Point<Pixels>,
+    ) -> bool {
+        // Matches determineIfTopRightIsLeading in shaders/cursor_tail.glsl, converted to
+        // screen-space coordinates where y grows downward.
+        let condition_one =
+            current_top_left.x >= previous_top_left.x && previous_top_left.y <= current_top_left.y;
+        let condition_two =
+            previous_top_left.x >= current_top_left.x && current_top_left.y <= previous_top_left.y;
+        !(condition_one || condition_two)
+    }
+
+    fn should_show_cursor_tail(shape: CursorShape, settings: CursorTailSettings) -> bool {
+        settings.enabled && shape == CursorShape::Block
+    }
+
+    fn should_layout_cursor(
+        is_local: bool,
+        show_local_cursors: bool,
+        shape: CursorShape,
+        settings: CursorTailSettings,
+    ) -> bool {
+        if !is_local || show_local_cursors {
+            return true;
+        }
+        Self::should_show_cursor_tail(shape, settings)
+    }
+
+    fn cursor_tail_color(
+        cursor_source: CursorTrailSource,
+        fallback_color: Hsla,
+        settings: CursorTailSettings,
+    ) -> Hsla {
+        let color = match cursor_source {
+            CursorTrailSource::Local => settings.color.unwrap_or(fallback_color),
+            CursorTrailSource::Remote(_) => fallback_color,
+        };
+        color.opacity(settings.opacity.clamp(0.0, 1.0))
+    }
+
+    fn layout_cursor_tail(
+        animation: CursorTrailAnimationState,
+        now: Instant,
+        settings: CursorTailSettings,
+        color: Hsla,
+        viewport_world_origin: gpui::Point<Pixels>,
+    ) -> Option<CursorTailLayout> {
+        // Mirrors the animation/easing progression in shaders/cursor_tail.glsl.
+        let duration = Duration::from_millis(settings.duration_ms.0);
+        if duration.is_zero() {
+            return None;
+        }
+
+        let elapsed = now.saturating_duration_since(animation.started_at);
+        let duration_seconds = duration.as_secs_f32();
+        if duration_seconds <= 0.0 {
+            return None;
+        }
+
+        let progress = Self::cursor_tail_quantized_progress(elapsed, duration);
+
+        let current_rect = CursorTrailRect {
+            origin: animation.to.origin - viewport_world_origin,
+            size: animation.to.size,
+        };
+        let previous_rect = CursorTrailRect {
+            origin: animation.from.origin - viewport_world_origin,
+            size: animation.from.size,
+        };
+        let center_current = point(
+            current_rect.origin.x + current_rect.size.width / 2.,
+            current_rect.origin.y + current_rect.size.height / 2.,
+        );
+        let center_previous = point(
+            previous_rect.origin.x + previous_rect.size.width / 2.,
+            previous_rect.origin.y + previous_rect.size.height / 2.,
+        );
+        let delta_x: f32 = (center_previous.x - center_current.x).into();
+        let delta_y: f32 = (center_previous.y - center_current.y).into();
+        let line_length = px((delta_x * delta_x + delta_y * delta_y).sqrt());
+        let min_distance = current_rect.size.height * settings.minimum_distance_multiplier;
+        if line_length <= min_distance {
+            return None;
+        }
+
+        let max_trail_length = current_rect.size.height * settings.max_length_multiplier;
+        if max_trail_length <= Pixels::ZERO {
+            return None;
+        }
+
+        let max_trail_length_f32: f32 = max_trail_length.into();
+        let line_length_f32: f32 = line_length.into();
+        let tail_delay_factor = max_trail_length_f32 / line_length_f32;
+        let is_long_move = if line_length >= max_trail_length {
+            1.0
+        } else {
+            0.0
+        };
+        let head_eased_short = Self::cursor_tail_ease_out_circ(progress);
+        let tail_eased_short = Self::cursor_tail_ease_out_circ(Self::cursor_tail_smoothstep(
+            tail_delay_factor,
+            1.0,
+            progress,
+        ));
+        let head_eased_long = 1.0;
+        let tail_eased_long = Self::cursor_tail_ease_out_circ(progress);
+        let head_eased = Self::cursor_tail_mix(head_eased_long, head_eased_short, is_long_move);
+        let tail_eased = Self::cursor_tail_mix(tail_eased_long, tail_eased_short, is_long_move);
+
+        let head_top_left =
+            Self::cursor_tail_mix_point(previous_rect.origin, current_rect.origin, head_eased);
+        let tail_top_left =
+            Self::cursor_tail_mix_point(previous_rect.origin, current_rect.origin, tail_eased);
+
+        let delta_abs_x = (center_current.x - center_previous.x).abs();
+        let delta_abs_y = (center_current.y - center_previous.y).abs();
+        let straight_axis_threshold = px(0.5);
+        let is_straight_move =
+            delta_abs_x <= straight_axis_threshold || delta_abs_y <= straight_axis_threshold;
+
+        let shape = if is_straight_move {
+            let head_center = point(
+                head_top_left.x + current_rect.size.width / 2.,
+                head_top_left.y + current_rect.size.height / 2.,
+            );
+            let tail_center = point(
+                tail_top_left.x + current_rect.size.width / 2.,
+                tail_top_left.y + current_rect.size.height / 2.,
+            );
+            let min_x = head_center.x.min(tail_center.x);
+            let min_y = head_center.y.min(tail_center.y);
+            let max_x = head_center.x.max(tail_center.x);
+            let max_y = head_center.y.max(tail_center.y);
+
+            let box_size = size(
+                (max_x - min_x) + current_rect.size.width,
+                (max_y - min_y) + current_rect.size.height,
+            );
+            let box_center = point((min_x + max_x) / 2., (min_y + max_y) / 2.);
+            CursorTailShape::Rectangle(Bounds {
+                origin: point(
+                    box_center.x - box_size.width / 2.,
+                    box_center.y - box_size.height / 2.,
+                ),
+                size: box_size,
+            })
+        } else {
+            let is_top_right_leading =
+                Self::cursor_tail_is_top_right_leading(current_rect.origin, previous_rect.origin);
+            let head_width = current_rect.size.width;
+            let head_height = current_rect.size.height;
+            let tail_height = previous_rect.size.height;
+
+            if is_top_right_leading {
+                CursorTailShape::Slanted([
+                    point(head_top_left.x + head_width, head_top_left.y + head_height),
+                    point(head_top_left.x, head_top_left.y),
+                    point(tail_top_left.x, tail_top_left.y),
+                    point(tail_top_left.x + head_width, tail_top_left.y + tail_height),
+                ])
+            } else {
+                CursorTailShape::Slanted([
+                    point(head_top_left.x, head_top_left.y + head_height),
+                    point(head_top_left.x + head_width, head_top_left.y),
+                    point(tail_top_left.x + head_width, tail_top_left.y),
+                    point(tail_top_left.x, tail_top_left.y + tail_height),
+                ])
+            }
+        };
+
+        Some(CursorTailLayout {
+            shape,
+            color,
+            animating: progress < 1.0,
+        })
+    }
+
     fn paint_cursors(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
+        let mut needs_animation_frame = false;
         for cursor in &mut layout.visible_cursors {
+            needs_animation_frame |= cursor.is_animating();
             cursor.paint(layout.content_origin, window, cx);
+        }
+        if needs_animation_frame {
+            window.request_animation_frame();
         }
     }
 
@@ -7894,6 +8208,8 @@ impl EditorElement {
                         let start = range.start.to_display_point(display_snapshot);
                         let end = range.end.to_display_point(display_snapshot);
                         let selection_layout = SelectionLayout {
+                            selection_id: 0,
+                            cursor_source: CursorTrailSource::Local,
                             head: start,
                             range: start..end,
                             cursor_shape: CursorShape::Bar,
@@ -10101,6 +10417,7 @@ impl Element for EditorElement {
                                 editor.selections.line_mode(),
                                 editor.cursor_offset_on_selection,
                                 editor.cursor_shape,
+                                CursorTrailSource::Local,
                                 &snapshot,
                                 true,
                                 true,
@@ -12031,8 +12348,51 @@ pub struct CursorLayout {
     line_height: Pixels,
     color: Hsla,
     shape: CursorShape,
+    trail: Option<CursorTailLayout>,
     block_text: Option<ShapedLine>,
+    show_body: bool,
     cursor_name: Option<AnyElement>,
+}
+
+#[derive(Clone, Copy)]
+enum CursorTailShape {
+    Rectangle(Bounds<Pixels>),
+    Slanted([gpui::Point<Pixels>; 4]),
+}
+
+#[derive(Clone, Copy)]
+struct CursorTailLayout {
+    shape: CursorTailShape,
+    color: Hsla,
+    animating: bool,
+}
+
+impl CursorTailLayout {
+    fn paint(&self, origin: gpui::Point<Pixels>, window: &mut Window) {
+        match self.shape {
+            CursorTailShape::Rectangle(bounds) => {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: bounds.origin + origin,
+                        size: bounds.size,
+                    },
+                    self.color,
+                ));
+            }
+            CursorTailShape::Slanted(points) => {
+                let p0 = points[0] + origin;
+                let p1 = points[1] + origin;
+                let p2 = points[2] + origin;
+                let p3 = points[3] + origin;
+
+                let mut path = gpui::Path::new(p0);
+                let st = (point(0., 1.), point(0., 1.), point(0., 1.));
+                path.push_triangle((p0, p1, p2), st);
+                path.push_triangle((p0, p2, p3), st);
+                window.paint_path(path, self.color);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -12057,7 +12417,9 @@ impl CursorLayout {
             line_height,
             color,
             shape,
+            trail: None,
             block_text,
+            show_body: true,
             cursor_name: None,
         }
     }
@@ -12129,6 +12491,13 @@ impl CursorLayout {
     }
 
     pub fn paint(&mut self, origin: gpui::Point<Pixels>, window: &mut Window, cx: &mut App) {
+        if let Some(trail) = self.trail {
+            trail.paint(origin, window);
+        }
+        if !self.show_body {
+            return;
+        }
+
         let bounds = self.bounds(origin);
 
         //Draw background or border quad
@@ -12160,6 +12529,10 @@ impl CursorLayout {
 
     pub fn shape(&self) -> CursorShape {
         self.shape
+    }
+
+    fn is_animating(&self) -> bool {
+        self.trail.is_some_and(|trail| trail.animating)
     }
 }
 
@@ -12429,6 +12802,7 @@ mod tests {
     use log::info;
     use rand::{RngCore, rngs::StdRng};
     use std::num::NonZeroU32;
+    use std::time::{Duration, Instant};
     use util::test::sample_text;
 
     #[gpui::test]
@@ -13290,6 +13664,8 @@ mod tests {
             };
 
             let spanning_selection = SelectionLayout {
+                selection_id: 0,
+                cursor_source: CursorTrailSource::Local,
                 head: DisplayPoint::new(DisplayRow(3), 7),
                 cursor_shape: CursorShape::Bar,
                 is_newest: true,
@@ -13339,6 +13715,8 @@ mod tests {
             };
 
             let selection = SelectionLayout {
+                selection_id: 0,
+                cursor_source: CursorTrailSource::Local,
                 head: DisplayPoint::new(DisplayRow(2), 0),
                 cursor_shape: CursorShape::Bar,
                 is_newest: true,
@@ -13522,6 +13900,235 @@ mod tests {
             assert_eq!(out[2].color, text_color);
             assert_eq!(out[3].color, adjusted_bg1);
         }
+    }
+
+    fn cursor_tail_settings_for_tests() -> CursorTailSettings {
+        CursorTailSettings {
+            enabled: true,
+            profile: settings::CursorTailProfile::Classic,
+            duration_ms: crate::editor_settings::DelayMs(90),
+            minimum_distance_multiplier: 1.5,
+            max_length_multiplier: 6.0,
+            opacity: 1.0,
+            color: None,
+        }
+    }
+
+    fn cursor_tail_animation_for_tests(
+        from_origin: gpui::Point<Pixels>,
+        to_origin: gpui::Point<Pixels>,
+    ) -> CursorTrailAnimationState {
+        CursorTrailAnimationState {
+            from: CursorTrailRect {
+                origin: from_origin,
+                size: size(px(10.), px(20.)),
+            },
+            to: CursorTrailRect {
+                origin: to_origin,
+                size: size(px(10.), px(20.)),
+            },
+            started_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_cursor_tail_threshold_gating() {
+        let animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(8.), px(0.)));
+        let now = animation.started_at + Duration::from_millis(45);
+
+        let mut strict_settings = cursor_tail_settings_for_tests();
+        strict_settings.minimum_distance_multiplier = 1.0;
+        assert!(
+            EditorElement::layout_cursor_tail(
+                animation,
+                now,
+                strict_settings,
+                Hsla::blue(),
+                point(px(0.), px(0.)),
+            )
+            .is_none()
+        );
+
+        let mut relaxed_settings = cursor_tail_settings_for_tests();
+        relaxed_settings.minimum_distance_multiplier = 0.1;
+        assert!(
+            EditorElement::layout_cursor_tail(
+                animation,
+                now,
+                relaxed_settings,
+                Hsla::blue(),
+                point(px(0.), px(0.)),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn test_cursor_tail_geometry_modes() {
+        let settings = cursor_tail_settings_for_tests();
+
+        let horizontal_animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(80.), px(0.)));
+        let horizontal = EditorElement::layout_cursor_tail(
+            horizontal_animation,
+            horizontal_animation.started_at + Duration::from_millis(45),
+            settings,
+            Hsla::blue(),
+            point(px(0.), px(0.)),
+        )
+        .unwrap();
+        assert!(matches!(horizontal.shape, CursorTailShape::Rectangle(_)));
+
+        let diagonal_animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(80.), px(40.)));
+        let diagonal = EditorElement::layout_cursor_tail(
+            diagonal_animation,
+            diagonal_animation.started_at + Duration::from_millis(45),
+            settings,
+            Hsla::blue(),
+            point(px(0.), px(0.)),
+        )
+        .unwrap();
+        assert!(matches!(diagonal.shape, CursorTailShape::Slanted(_)));
+
+        let mostly_vertical_animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(0.2), px(80.)));
+        let mostly_vertical = EditorElement::layout_cursor_tail(
+            mostly_vertical_animation,
+            mostly_vertical_animation.started_at + Duration::from_millis(45),
+            settings,
+            Hsla::blue(),
+            point(px(0.), px(0.)),
+        )
+        .unwrap();
+        assert!(matches!(
+            mostly_vertical.shape,
+            CursorTailShape::Rectangle(_)
+        ));
+    }
+
+    #[test]
+    fn test_cursor_tail_short_vs_long_move_progression() {
+        let animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(160.), px(0.)));
+        let now = animation.started_at + Duration::from_millis(45);
+
+        let mut short_move_settings = cursor_tail_settings_for_tests();
+        short_move_settings.max_length_multiplier = 20.0;
+        let short_move = EditorElement::layout_cursor_tail(
+            animation,
+            now,
+            short_move_settings,
+            Hsla::blue(),
+            point(px(0.), px(0.)),
+        )
+        .unwrap();
+
+        let mut long_move_settings = cursor_tail_settings_for_tests();
+        long_move_settings.max_length_multiplier = 1.0;
+        let long_move = EditorElement::layout_cursor_tail(
+            animation,
+            now,
+            long_move_settings,
+            Hsla::blue(),
+            point(px(0.), px(0.)),
+        )
+        .unwrap();
+
+        let short_right = match short_move.shape {
+            CursorTailShape::Rectangle(bounds) => bounds.right(),
+            CursorTailShape::Slanted(_) => unreachable!("expected straight movement rectangle"),
+        };
+        let long_right = match long_move.shape {
+            CursorTailShape::Rectangle(bounds) => bounds.right(),
+            CursorTailShape::Slanted(_) => unreachable!("expected straight movement rectangle"),
+        };
+
+        assert!(short_right > long_right);
+    }
+
+    #[test]
+    fn test_cursor_tail_world_positions_are_projected_into_viewport() {
+        let animation =
+            cursor_tail_animation_for_tests(point(px(0.), px(0.)), point(px(0.), px(40.)));
+        let now = animation.started_at + Duration::from_millis(45);
+
+        let tail = EditorElement::layout_cursor_tail(
+            animation,
+            now,
+            cursor_tail_settings_for_tests(),
+            Hsla::blue(),
+            point(px(0.), px(35.)),
+        )
+        .unwrap();
+
+        let top = match tail.shape {
+            CursorTailShape::Rectangle(bounds) => bounds.top(),
+            CursorTailShape::Slanted(_) => unreachable!("expected straight movement rectangle"),
+        };
+
+        assert!(top < px(15.));
+    }
+
+    #[test]
+    fn test_cursor_tail_color_scope_local_only() {
+        let mut settings = cursor_tail_settings_for_tests();
+        settings.opacity = 0.5;
+        settings.color = Some(Hsla::red());
+
+        let fallback = Hsla::blue();
+        let local = EditorElement::cursor_tail_color(CursorTrailSource::Local, fallback, settings);
+        let remote = EditorElement::cursor_tail_color(
+            CursorTrailSource::Remote(clock::ReplicaId::new(7)),
+            fallback,
+            settings,
+        );
+
+        assert_eq!(local, Hsla::red().opacity(0.5));
+        assert_eq!(remote, fallback.opacity(0.5));
+    }
+
+    #[test]
+    fn test_cursor_tail_block_only_activation() {
+        let mut settings = cursor_tail_settings_for_tests();
+        assert!(EditorElement::should_show_cursor_tail(
+            CursorShape::Block,
+            settings,
+        ));
+        assert!(!EditorElement::should_show_cursor_tail(
+            CursorShape::Bar,
+            settings,
+        ));
+
+        settings.enabled = false;
+        assert!(!EditorElement::should_show_cursor_tail(
+            CursorShape::Block,
+            settings,
+        ));
+    }
+
+    #[test]
+    fn test_cursor_tail_keeps_layout_when_local_cursor_is_hidden_by_blink() {
+        let settings = cursor_tail_settings_for_tests();
+        assert!(EditorElement::should_layout_cursor(
+            true,
+            false,
+            CursorShape::Block,
+            settings,
+        ));
+        assert!(!EditorElement::should_layout_cursor(
+            true,
+            false,
+            CursorShape::Bar,
+            settings,
+        ));
+        assert!(EditorElement::should_layout_cursor(
+            false,
+            false,
+            CursorShape::Block,
+            settings,
+        ));
     }
 
     #[test]
