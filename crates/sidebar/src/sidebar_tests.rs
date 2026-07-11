@@ -2009,9 +2009,7 @@ async fn test_agent_panel_terminal_shows_project_and_linked_worktree(cx: &mut Te
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace(
-    cx: &mut TestAppContext,
-) {
+async fn test_terminal_close_event_preserves_linked_worktree(cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -2175,8 +2173,8 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
             .is_none()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
+        !empty_draft_metadata_deleted,
+        "closing a terminal should not delete the worktree's draft"
     );
     let unarchived_worktree_threads = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -2185,25 +2183,20 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
             .count()
     });
     assert_eq!(
-        unarchived_worktree_threads, 0,
-        "closing the terminal must not create a fallback draft for the removed worktree"
+        unarchived_worktree_threads, 1,
+        "closing the terminal should preserve the worktree's draft"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
             .workspaces()
             .count()),
-        1,
-        "linked worktree workspace should be removed after closing its last terminal"
-    );
-    let entries_after = visible_entries_as_strings(&sidebar, cx);
-    assert!(
-        !entries_after.iter().any(|entry| entry.contains('{')),
-        "no sidebar entry should reference the archived worktree, got: {entries_after:?}"
+        2,
+        "linked worktree workspace should remain after closing its last terminal"
     );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after closing its last terminal"
+        "closing a terminal should not remove its linked worktree directory"
     );
 }
 

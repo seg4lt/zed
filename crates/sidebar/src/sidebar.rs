@@ -5051,23 +5051,11 @@ impl Sidebar {
             })
             .and_then(|position| self.neighboring_activatable_entry(position));
 
-        let terminal_folder_paths = metadata.folder_paths().clone();
-        let roots_to_archive = self.roots_to_archive_for_paths(
-            metadata.folder_paths(),
-            metadata.remote_connection.as_ref(),
-            None,
-            Some(terminal_id),
-            cx,
-        );
+        // Closing a terminal is not an explicit request to delete its worktree.
+        // Worktrees remain available until the user removes them from the worktree picker.
+        let roots_to_archive = Vec::new();
 
-        let workspace_to_remove = self.linked_worktree_workspace_to_remove(
-            &terminal_folder_paths,
-            metadata.remote_connection.as_ref(),
-            None,
-            Some(terminal_id),
-            &roots_to_archive,
-            cx,
-        );
+        let workspace_to_remove: Option<Entity<Workspace>> = None;
 
         let mut workspaces_to_remove: Vec<Entity<Workspace>> =
             workspace_to_remove.into_iter().collect();

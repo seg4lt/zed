@@ -285,9 +285,7 @@ pub mod workspace {
     );
 }
 
-/// Describes which ref to base a new git worktree on. The worktree is
-/// always created in a detached HEAD state; users can opt into creating
-/// a branch afterwards from the worktree itself.
+/// Describes how to select the branch or ref for a new git worktree.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum NewWorktreeBranchTarget {
@@ -300,6 +298,12 @@ pub enum NewWorktreeBranchTarget {
     RemoteBranch {
         remote_name: String,
         branch_name: String,
+    },
+    /// Create and check out a new local branch, optionally based on a remote-tracking branch.
+    NewBranch {
+        name: String,
+        remote_name: Option<String>,
+        remote_branch_name: Option<String>,
     },
 }
 

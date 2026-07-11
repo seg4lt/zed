@@ -364,6 +364,14 @@ pub fn resolve_worktree_branch_target(branch_target: &NewWorktreeBranchTarget) -
             remote_name,
             branch_name,
         } => Some(format!("refs/remotes/{remote_name}/{branch_name}")),
+        NewWorktreeBranchTarget::NewBranch {
+            remote_name,
+            remote_branch_name,
+            ..
+        } => remote_name
+            .as_ref()
+            .zip(remote_branch_name.as_ref())
+            .map(|(remote_name, branch_name)| format!("refs/remotes/{remote_name}/{branch_name}")),
     }
 }
 
@@ -373,9 +381,14 @@ fn remote_branch_to_fetch(branch_target: &NewWorktreeBranchTarget) -> Option<(&s
             remote_name,
             branch_name,
         } => Some((remote_name, branch_name)),
-        NewWorktreeBranchTarget::CurrentBranch | NewWorktreeBranchTarget::ExistingBranch { .. } => {
-            None
-        }
+        NewWorktreeBranchTarget::NewBranch {
+            remote_name: Some(remote_name),
+            remote_branch_name: Some(branch_name),
+            ..
+        } => Some((remote_name, branch_name)),
+        NewWorktreeBranchTarget::CurrentBranch
+        | NewWorktreeBranchTarget::ExistingBranch { .. }
+        | NewWorktreeBranchTarget::NewBranch { .. } => None,
     }
 }
 
@@ -456,6 +469,8 @@ fn start_worktree_creations(
     existing_worktree_names: &[String],
     existing_worktree_paths: &HashSet<PathBuf>,
     base_ref: Option<String>,
+    branch_name: Option<String>,
+    repositories_with_existing_branch: &[Entity<Repository>],
     worktree_directory_setting: &str,
     rng: &mut impl rand::Rng,
     cx: &mut gpui::App,
@@ -478,6 +493,7 @@ fn start_worktree_creations(
     });
 
     for repo in git_repos {
+        let branch_exists = repositories_with_existing_branch.contains(repo);
         let (work_dir, new_path, receiver) = repo.update(cx, |repo, _cx| {
             let new_path =
                 repo.path_for_new_linked_worktree(&worktree_name, worktree_directory_setting)?;
@@ -491,9 +507,8 @@ fn start_worktree_creations(
             let receiver = if scheduled_paths.contains(&new_path) {
                 None
             } else {
-                let target = git::repository::CreateWorktreeTarget::Detached {
-                    base_sha: base_ref.clone(),
-                };
+                let target =
+                    worktree_creation_target(branch_name.clone(), base_ref.clone(), branch_exists);
                 Some(repo.create_worktree(target, new_path.clone()))
             };
             anyhow::Ok((work_dir, new_path, receiver))
@@ -506,6 +521,23 @@ fn start_worktree_creations(
     }
 
     Ok((creation_infos, path_remapping))
+}
+
+fn worktree_creation_target(
+    branch_name: Option<String>,
+    base_ref: Option<String>,
+    branch_exists: bool,
+) -> git::repository::CreateWorktreeTarget {
+    match branch_name {
+        Some(branch_name) if branch_exists => {
+            git::repository::CreateWorktreeTarget::ExistingBranch { branch_name }
+        }
+        Some(branch_name) => git::repository::CreateWorktreeTarget::NewBranch {
+            branch_name,
+            base_sha: base_ref,
+        },
+        None => git::repository::CreateWorktreeTarget::Detached { base_sha: base_ref },
+    }
 }
 
 /// Waits for every in-flight worktree creation to complete. If any
@@ -1031,6 +1063,34 @@ async fn do_create_worktree(
     let mut rng = rand::rng();
 
     let base_ref = resolve_worktree_branch_target(&branch_target);
+    let branch_name = match &branch_target {
+        NewWorktreeBranchTarget::NewBranch { name, .. } => Some(name.clone()),
+        _ => None,
+    };
+    let mut repositories_with_existing_branch = Vec::new();
+    if let Some(branch_name) = branch_name.as_deref() {
+        let local_ref_name = format!("refs/heads/{branch_name}");
+        let branch_requests = cx.update(|_, cx| {
+            git_repos
+                .iter()
+                .cloned()
+                .map(|repository| {
+                    let request = repository.update(cx, |repository, _| repository.branches());
+                    (repository, request)
+                })
+                .collect::<Vec<_>>()
+        })?;
+        for (repository, request) in branch_requests {
+            let scan = request.await??;
+            if scan
+                .branches
+                .iter()
+                .any(|branch| branch.ref_name.as_ref() == local_ref_name)
+            {
+                repositories_with_existing_branch.push(repository);
+            }
+        }
+    }
 
     let (creation_infos, path_remapping) = cx.update(|_, cx| {
         start_worktree_creations(
@@ -1039,6 +1099,8 @@ async fn do_create_worktree(
             &existing_worktree_names,
             &existing_worktree_paths,
             base_ref,
+            branch_name,
+            &repositories_with_existing_branch,
             &worktree_directory_setting,
             &mut rng,
             cx,
@@ -1718,6 +1780,45 @@ mod tests {
         );
         assert_eq!(RemoteBranchName::parse("main"), None);
         assert_eq!(RemoteBranchName::parse("origin/"), None);
+    }
+
+    #[test]
+    fn test_new_worktree_branch_target() {
+        let remote_branch = NewWorktreeBranchTarget::NewBranch {
+            name: "feature/foo".to_string(),
+            remote_name: Some("origin".to_string()),
+            remote_branch_name: Some("feature/foo".to_string()),
+        };
+        assert_eq!(
+            resolve_worktree_branch_target(&remote_branch).as_deref(),
+            Some("refs/remotes/origin/feature/foo")
+        );
+        assert_eq!(
+            remote_branch_to_fetch(&remote_branch),
+            Some(("origin", "feature/foo"))
+        );
+
+        let new_branch = NewWorktreeBranchTarget::NewBranch {
+            name: "feature/bar".to_string(),
+            remote_name: None,
+            remote_branch_name: None,
+        };
+        assert_eq!(resolve_worktree_branch_target(&new_branch), None);
+        assert_eq!(remote_branch_to_fetch(&new_branch), None);
+
+        assert_eq!(
+            worktree_creation_target(Some("feature/foo".into()), None, true),
+            git::repository::CreateWorktreeTarget::ExistingBranch {
+                branch_name: "feature/foo".into(),
+            }
+        );
+        assert_eq!(
+            worktree_creation_target(Some("feature/foo".into()), None, false),
+            git::repository::CreateWorktreeTarget::NewBranch {
+                branch_name: "feature/foo".into(),
+                base_sha: None,
+            }
+        );
     }
 
     #[test]
