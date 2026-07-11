@@ -56,7 +56,7 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    Scrollbars, SpinnerVariant, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
     prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -104,6 +104,17 @@ gpui::actions!(
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
+
+fn terminal_status_icon(
+    status: AgentThreadStatus,
+    completed_notification_pending: bool,
+) -> IconName {
+    if status == AgentThreadStatus::Completed && completed_notification_pending {
+        IconName::Check
+    } else {
+        IconName::Terminal
+    }
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SerializedSidebarView {
@@ -367,6 +378,8 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    status: AgentThreadStatus,
+    completed_notification_pending: bool,
     highlight_positions: Vec<usize>,
 }
 
@@ -1422,15 +1435,25 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
-        let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_states: HashMap<TerminalId, (bool, AgentThreadStatus, bool)> =
+            HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
+                live_terminal_states.extend(
                     agent_panel
                         .read(cx)
                         .terminals(cx)
                         .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
+                        .map(|terminal| {
+                            (
+                                terminal.id,
+                                (
+                                    terminal.has_notification,
+                                    terminal.status,
+                                    terminal.completed_notification_pending,
+                                ),
+                            )
+                        }),
                 );
             }
         }
@@ -1493,13 +1516,17 @@ impl Sidebar {
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
-                    let has_notification =
-                        live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let (has_notification, status, completed_notification_pending) = live_terminal_states
+                        .get(&metadata.terminal_id)
+                        .copied()
+                        .unwrap_or((false, AgentThreadStatus::Completed, false));
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
+                        status,
+                        completed_notification_pending,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -5997,6 +6024,8 @@ impl Sidebar {
                         notified: self
                             .contents
                             .is_terminal_notified(terminal.metadata.terminal_id),
+                        status: terminal.status,
+                        completed_notification_pending: terminal.completed_notification_pending,
                         timestamp,
                     }))
                 }
@@ -6651,12 +6680,24 @@ impl Sidebar {
 
         ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
-            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .icon(terminal_status_icon(
+                terminal.status,
+                terminal.completed_notification_pending,
+            ))
+            .status(terminal.status)
+            .running_spinner_variant(SpinnerVariant::DotsVariant)
+            .when_some(
+                (!terminal.completed_notification_pending)
+                    .then_some(icon_char)
+                    .flatten(),
+                |this, icon_char| this.icon_char(icon_char),
+            )
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)
-            .notified(terminal.has_notification)
+            .notified(
+                terminal.has_notification && !terminal.completed_notification_pending,
+            )
             .highlight_positions(highlight_positions)
             .selected(is_active)
             .focused(is_focused)

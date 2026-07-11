@@ -8,11 +8,14 @@ use gpui::{
     Action as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
     ModifiersChangedEvent, Render, ScrollHandle, SharedString, prelude::*,
 };
-use ui::{AgentThreadStatus, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar, prelude::*};
+use ui::{
+    AgentThreadStatus, SpinnerVariant, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar,
+    prelude::*,
+};
 use workspace::{ModalView, Workspace};
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
-use super::ThreadEntryWorkspace;
+use super::{ThreadEntryWorkspace, terminal_status_icon};
 
 #[derive(Clone)]
 pub(crate) struct ThreadSwitcherThreadEntry {
@@ -38,6 +41,8 @@ pub(crate) struct ThreadSwitcherTerminalEntry {
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
     pub notified: bool,
+    pub status: AgentThreadStatus,
+    pub completed_notification_pending: bool,
     pub timestamp: SharedString,
 }
 
@@ -97,7 +102,10 @@ impl ThreadSwitcherEntry {
         match self {
             Self::Thread(entry) if entry.is_draft => IconName::Circle,
             Self::Thread(entry) => entry.icon,
-            Self::Terminal(_) => IconName::Terminal,
+            Self::Terminal(entry) => terminal_status_icon(
+                entry.status,
+                entry.completed_notification_pending,
+            ),
         }
     }
 
@@ -112,7 +120,7 @@ impl ThreadSwitcherEntry {
     fn status(&self) -> AgentThreadStatus {
         match self {
             Self::Thread(entry) => entry.status,
-            Self::Terminal(_) => AgentThreadStatus::default(),
+            Self::Terminal(entry) => entry.status,
         }
     }
 
@@ -386,6 +394,9 @@ impl Render for ThreadSwitcher {
                                 ))
                             })
                             .status(entry.status())
+                            .when(matches!(entry, ThreadSwitcherEntry::Terminal(_)), |this| {
+                                this.running_spinner_variant(SpinnerVariant::DotsVariant)
+                            })
                             .when_some(entry.icon_from_external_svg(), |this, svg| {
                                 this.custom_icon_from_external_svg(svg)
                             })

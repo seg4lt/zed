@@ -1,4 +1,7 @@
-use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
+use crate::{
+    CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, SpinnerLabel, SpinnerVariant,
+    Tooltip, prelude::*,
+};
 
 use gpui::{
     Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
@@ -48,6 +51,7 @@ pub struct ThreadItem {
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
+    running_spinner_variant: Option<SpinnerVariant>,
     selected: bool,
     focused: bool,
     hovered: bool,
@@ -83,6 +87,7 @@ impl ThreadItem {
             timestamp: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
+            running_spinner_variant: None,
             selected: false,
             focused: false,
             hovered: false,
@@ -141,6 +146,11 @@ impl ThreadItem {
 
     pub fn status(mut self, status: AgentThreadStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    pub fn running_spinner_variant(mut self, variant: SpinnerVariant) -> Self {
+        self.running_spinner_variant = Some(variant);
         self
     }
 
@@ -337,7 +347,13 @@ impl RenderOnce for ThreadItem {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
+        let icon = if self.status == AgentThreadStatus::Running
+            && let Some(variant) = self.running_spinner_variant
+        {
+            icon_container()
+                .child(SpinnerLabel::with_variant(variant).size(LabelSize::Small))
+                .into_any_element()
+        } else if self.status == AgentThreadStatus::Running {
             icon_container()
                 .child(
                     Icon::new(IconName::LoadCircle)

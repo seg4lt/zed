@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/acp_thread",
     "crates/acp_tools",
+    "crates/alacritty_terminal",
     "crates/action_log",
     "crates/activity_indicator",
     "crates/agent",
@@ -218,6 +219,7 @@ members = [
     "crates/ui_prompt",
     "crates/util",
     "crates/util_macros",
+    "crates/vte",
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
@@ -510,7 +512,7 @@ accesskit_unix = "0.21.0"
 accesskit_windows = "0.33.1"
 agent-client-protocol = { version = "=1.1.0", features = ["unstable"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+alacritty_terminal = { path = "crates/alacritty_terminal" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 ashpd = { version = "0.13", default-features = false, features = [
@@ -828,7 +830,7 @@ url = "2.2"
 urlencoding = "2.1.2"
 usvg = { version = "0.46.0", default-features = false }
 uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
-vte = { version = "0.15.0", features = ["ansi"] }
+vte = { path = "crates/vte", features = ["ansi"] }
 walkdir = "2.5"
 wasm-encoder = "0.252"
 wasmparser = "0.252"

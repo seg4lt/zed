@@ -24,6 +24,22 @@ use std::{
 };
 use util::{path_list::PathList, rel_path::rel_path};
 
+#[test]
+fn completed_terminal_uses_check_icon() {
+    assert_eq!(
+        terminal_status_icon(AgentThreadStatus::Completed, true),
+        IconName::Check
+    );
+    assert_eq!(
+        terminal_status_icon(AgentThreadStatus::Completed, false),
+        IconName::Terminal
+    );
+    assert_eq!(
+        terminal_status_icon(AgentThreadStatus::Running, false),
+        IconName::Terminal
+    );
+}
+
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);

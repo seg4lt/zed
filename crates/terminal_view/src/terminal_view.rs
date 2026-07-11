@@ -35,7 +35,8 @@ use task::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
+    Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds,
+    TerminalProgress, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -43,7 +44,7 @@ use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
 use ui::{
-    ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    CommonAnimationExt, ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
@@ -395,8 +396,8 @@ impl TerminalView {
     /// Commits (sends) the given text to the PTY. Called by InputHandler::replace_text_in_range.
     pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !text.is_empty() {
-            self.terminal.update(cx, |term, _| {
-                term.input(text.to_string().into_bytes());
+            self.terminal.update(cx, |term, cx| {
+                term.input(text.to_string().into_bytes(), cx);
             });
         }
     }
@@ -638,6 +639,7 @@ impl TerminalView {
                 term.try_keystroke(
                     &Keystroke::parse("ctrl-cmd-space").unwrap(),
                     TerminalSettings::get_global(cx).option_as_meta,
+                    cx,
                 )
             });
         } else {
@@ -918,7 +920,7 @@ impl TerminalView {
             _ => {
                 if let Some(text) = clipboard.text() {
                     self.terminal
-                        .update(cx, |terminal, _cx| terminal.paste(&text));
+                        .update(cx, |terminal, cx| terminal.paste(&text, cx));
                 }
             }
         }
@@ -944,15 +946,15 @@ impl TerminalView {
 
         if let Some(text) = clipboard.text() {
             self.terminal
-                .update(cx, |terminal, _cx| terminal.paste(&text));
+                .update(cx, |terminal, cx| terminal.paste(&text, cx));
         }
     }
 
     /// Emits a raw Ctrl+V so TUI agents can read the OS clipboard directly
     /// and attach images using their native workflows.
     fn forward_ctrl_v(&self, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |term, _| {
-            term.input(vec![0x16]);
+        self.terminal.update(cx, |term, cx| {
+            term.input(vec![0x16], cx);
         });
     }
 
@@ -963,16 +965,16 @@ impl TerminalView {
             .collect::<String>();
         text.push(' ');
         window.focus(&self.focus_handle(cx), cx);
-        self.terminal.update(cx, |terminal, _| {
-            terminal.paste(&text);
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.paste(&text, cx);
         });
     }
 
     fn send_text(&mut self, text: &SendText, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
-        self.terminal.update(cx, |term, _| {
-            term.input(text.0.to_string().into_bytes());
+        self.terminal.update(cx, |term, cx| {
+            term.input(text.0.to_string().into_bytes(), cx);
         });
     }
 
@@ -1222,6 +1224,8 @@ fn subscribe_for_terminal_events(
                     ),
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
+                Event::ProgressChanged => cx.emit(ItemEvent::UpdateTab),
+                Event::Notification(_) | Event::Input => {}
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
@@ -1267,7 +1271,11 @@ impl TerminalView {
     fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
             (
-                term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),
+                term.try_keystroke(
+                    keystroke,
+                    TerminalSettings::get_global(cx).option_as_meta,
+                    cx,
+                ),
                 term.vi_mode_enabled(),
             )
         });
@@ -1464,29 +1472,49 @@ impl Item for TerminalView {
             .cloned()
             .unwrap_or_else(|| terminal.title(true));
 
-        let (icon, icon_color, rerun_button) = match terminal.task() {
-            Some(terminal_task) => match &terminal_task.status {
-                TaskStatus::Running => (
-                    IconName::PlayFilled,
-                    Color::Disabled,
-                    TerminalView::rerun_button(terminal_task),
-                ),
-                TaskStatus::Unknown => (
-                    IconName::Warning,
-                    Color::Warning,
-                    TerminalView::rerun_button(terminal_task),
-                ),
-                TaskStatus::Completed { success } => {
-                    let rerun_button = TerminalView::rerun_button(terminal_task);
+        let (icon, icon_color, rerun_button, is_spinning) = match terminal.progress() {
+            Some(TerminalProgress::Normal(_)) => {
+                (IconName::TodoProgress, Color::Accent, None, false)
+            }
+            Some(TerminalProgress::Error(_)) => (IconName::XCircle, Color::Error, None, false),
+            Some(TerminalProgress::Indeterminate) => {
+                (IconName::ArrowCircle, Color::Accent, None, true)
+            }
+            Some(TerminalProgress::Warning(_)) => (IconName::Warning, Color::Warning, None, false),
+            None => match terminal.task() {
+                Some(terminal_task) => match &terminal_task.status {
+                    TaskStatus::Running => (
+                        IconName::PlayFilled,
+                        Color::Disabled,
+                        TerminalView::rerun_button(terminal_task),
+                        false,
+                    ),
+                    TaskStatus::Unknown => (
+                        IconName::Warning,
+                        Color::Warning,
+                        TerminalView::rerun_button(terminal_task),
+                        false,
+                    ),
+                    TaskStatus::Completed { success } => {
+                        let rerun_button = TerminalView::rerun_button(terminal_task);
 
-                    if *success {
-                        (IconName::Check, Color::Success, rerun_button)
-                    } else {
-                        (IconName::XCircle, Color::Error, rerun_button)
+                        if *success {
+                            (IconName::Check, Color::Success, rerun_button, false)
+                        } else {
+                            (IconName::XCircle, Color::Error, rerun_button, false)
+                        }
                     }
-                }
+                },
+                None => (IconName::Terminal, Color::Muted, None, false),
             },
-            None => (IconName::Terminal, Color::Muted, None),
+        };
+        let icon = if is_spinning {
+            Icon::new(icon)
+                .color(icon_color)
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else {
+            Icon::new(icon).color(icon_color).into_any_element()
         };
 
         let self_handle = self.self_handle.clone();
@@ -1509,7 +1537,7 @@ impl Item for TerminalView {
                             .when(rerun_button.is_some(), |this| {
                                 this.hover(|style| style.invisible().w_0())
                             })
-                            .child(Icon::new(icon).color(icon_color)),
+                            .child(icon),
                     )
                     .when_some(rerun_button, |this, rerun_button| {
                         this.child(

@@ -292,7 +292,29 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, HashMap::default(), cx)
+    }
+
+    pub fn create_agent_terminal_shell(
+        &mut self,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(
+            cwd,
+            false,
+            HashMap::from_iter([
+                (
+                    "ZED_TERM_PROGRAM_OVERRIDE".to_string(),
+                    "ghostty".to_string(),
+                ),
+                (
+                    "ZED_TERM_PROGRAM_VERSION_OVERRIDE".to_string(),
+                    "1.2.0".to_string(),
+                ),
+            ]),
+            cx,
+        )
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -309,7 +331,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, HashMap::default(), cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -319,6 +341,7 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        environment_overrides: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -382,6 +405,7 @@ impl Project {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            env.extend(environment_overrides);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {

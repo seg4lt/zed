@@ -638,11 +638,17 @@ pub fn insert_zed_terminal_env(
     env: &mut HashMap<String, String>,
     version: &impl std::fmt::Display,
 ) {
+    let term_program = env
+        .remove("ZED_TERM_PROGRAM_OVERRIDE")
+        .unwrap_or_else(|| "zed".to_string());
+    let term_program_version = env
+        .remove("ZED_TERM_PROGRAM_VERSION_OVERRIDE")
+        .unwrap_or_else(|| version.to_string());
     env.insert("ZED_TERM".to_string(), "true".to_string());
-    env.insert("TERM_PROGRAM".to_string(), "zed".to_string());
+    env.insert("TERM_PROGRAM".to_string(), term_program);
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
-    env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());
+    env.insert("TERM_PROGRAM_VERSION".to_string(), term_program_version);
 }
 
 ///Upward flowing events, for changing the title and such
@@ -650,6 +656,9 @@ pub fn insert_zed_terminal_env(
 pub enum Event {
     TitleChanged,
     BreadcrumbsChanged,
+    ProgressChanged,
+    Notification(String),
+    Input,
     CloseTerminal,
     Bell,
     Wakeup,
@@ -706,6 +715,8 @@ pub(crate) enum TerminalBackendEvent {
     MouseCursorDirty,
     Title(String),
     ResetTitle,
+    Progress(Option<TerminalProgress>),
+    Notification(String),
     ClipboardStore(String),
     ClipboardLoad(ClipboardFormatter),
     ColorRequest(usize, ColorFormatter),
@@ -724,6 +735,8 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::MouseCursorDirty => f.write_str("MouseCursorDirty"),
             Self::Title(title) => write!(f, "Title({title})"),
             Self::ResetTitle => f.write_str("ResetTitle"),
+            Self::Progress(progress) => write!(f, "Progress({progress:?})"),
+            Self::Notification(message) => write!(f, "Notification({message})"),
             Self::ClipboardStore(data) => write!(f, "ClipboardStore({data})"),
             Self::ClipboardLoad(_) => f.write_str("ClipboardLoad"),
             Self::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
@@ -973,6 +986,7 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
+            progress: None,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -997,6 +1011,7 @@ impl TerminalBuilder {
             },
             child_exited: None,
             keyboard_input_sent: false,
+            input_generation: 0,
             init_command_startup_marker: None,
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
@@ -1243,6 +1258,7 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
+                progress: None,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1270,6 +1286,7 @@ impl TerminalBuilder {
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
+                input_generation: 0,
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
@@ -1422,6 +1439,7 @@ pub struct Terminal {
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
+    progress: Option<TerminalProgress>,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1439,6 +1457,7 @@ pub struct Terminal {
     activation_script: Vec<String>,
     child_exited: Option<ExitStatus>,
     keyboard_input_sent: bool,
+    input_generation: u64,
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
@@ -1478,6 +1497,14 @@ pub enum TaskStatus {
     Running,
     /// After the start, the task stopped running and reported its error code back.
     Completed { success: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalProgress {
+    Normal(u8),
+    Error(Option<u8>),
+    Indeterminate,
+    Warning(u8),
 }
 
 impl TaskStatus {
@@ -1531,6 +1558,11 @@ impl Terminal {
                 self.breadcrumb_text = String::new();
                 cx.emit(Event::BreadcrumbsChanged);
             }
+            TerminalBackendEvent::Progress(progress) => {
+                self.progress = progress;
+                cx.emit(Event::ProgressChanged);
+            }
+            TerminalBackendEvent::Notification(message) => cx.emit(Event::Notification(message)),
             TerminalBackendEvent::ClipboardStore(data) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(data))
             }
@@ -1590,6 +1622,10 @@ impl Terminal {
 
     pub fn selection_started(&self) -> bool {
         self.selection_phase == SelectionPhase::Selecting
+    }
+
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.progress
     }
 
     fn process_terminal_event(
@@ -1985,10 +2021,12 @@ impl Terminal {
         }
     }
 
-    pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>) {
+    pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>, cx: &mut Context<Self>) {
         self.keyboard_input_sent = true;
+        self.input_generation = self.input_generation.wrapping_add(1);
         self.complete_init_command_startup_handshake();
         self.write_input(input);
+        cx.emit(Event::Input);
     }
 
     /// Sends a shell-level marker command and returns a task that completes when
@@ -2115,6 +2153,10 @@ impl Terminal {
         self.keyboard_input_sent
     }
 
+    pub fn input_generation(&self) -> u64 {
+        self.input_generation
+    }
+
     pub fn toggle_vi_mode(&mut self) {
         self.events.push_back(InternalEvent::ToggleViMode);
     }
@@ -2209,7 +2251,12 @@ impl Terminal {
         }
     }
 
-    pub fn try_keystroke(&mut self, keystroke: &Keystroke, option_as_meta: bool) -> bool {
+    pub fn try_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        option_as_meta: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.vi_mode_enabled {
             self.vi_motion(keystroke);
             return true;
@@ -2219,8 +2266,8 @@ impl Terminal {
         let esc = to_esc_str(keystroke, self.last_content.mode, option_as_meta);
         if let Some(esc) = esc {
             match esc {
-                Cow::Borrowed(string) => self.input(string.as_bytes()),
-                Cow::Owned(string) => self.input(string.into_bytes()),
+                Cow::Borrowed(string) => self.input(string.as_bytes(), cx),
+                Cow::Owned(string) => self.input(string.into_bytes(), cx),
             };
             true
         } else {
@@ -2247,14 +2294,14 @@ impl Terminal {
     }
 
     ///Paste text into the terminal
-    pub fn paste(&mut self, text: &str) {
+    pub fn paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let paste_text = if self.last_content.mode.contains(Modes::BRACKETED_PASTE) {
             format!("{}{}{}", "\x1b[200~", text.replace('\x1b', ""), "\x1b[201~")
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
 
-        self.input(paste_text.into_bytes());
+        self.input(paste_text.into_bytes(), cx);
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2528,7 +2575,7 @@ impl Terminal {
                 MouseButton::Middle => {
                     if let Some(item) = cx.read_from_primary() {
                         let text = item.text().unwrap_or_default();
-                        self.paste(&text);
+                        self.paste(&text, cx);
                     }
                 }
                 _ => {}
@@ -2834,6 +2881,9 @@ impl Terminal {
         exit_status: Option<ExitStatus>,
         cx: &mut Context<Terminal>,
     ) {
+        if self.progress.take().is_some() {
+            cx.emit(Event::ProgressChanged);
+        }
         if let Some(tx) = &self.completion_tx {
             tx.try_send(exit_status).ok();
         }
@@ -3317,6 +3367,33 @@ mod tests {
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
     use task::{Shell, ShellBuilder};
+
+    #[test]
+    fn terminal_program_override_is_consumed() {
+        let mut environment = HashMap::from_iter([
+            (
+                "ZED_TERM_PROGRAM_OVERRIDE".to_string(),
+                "ghostty".to_string(),
+            ),
+            (
+                "ZED_TERM_PROGRAM_VERSION_OVERRIDE".to_string(),
+                "1.2.0".to_string(),
+            ),
+        ]);
+
+        insert_zed_terminal_env(&mut environment, &"zed-version");
+
+        assert_eq!(
+            environment.get("TERM_PROGRAM").map(String::as_str),
+            Some("ghostty")
+        );
+        assert_eq!(
+            environment.get("TERM_PROGRAM_VERSION").map(String::as_str),
+            Some("1.2.0")
+        );
+        assert!(!environment.contains_key("ZED_TERM_PROGRAM_OVERRIDE"));
+        assert!(!environment.contains_key("ZED_TERM_PROGRAM_VERSION_OVERRIDE"));
+    }
 
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {
@@ -3849,8 +3926,12 @@ mod tests {
 
         let first_event = event_rx.recv().await.expect("No wakeup event received");
 
-        terminal.update(cx, |terminal, _| {
-            let success = terminal.try_keystroke(&Keystroke::parse("ctrl-d").unwrap(), false);
+        terminal.update(cx, |terminal, cx| {
+            let success = terminal.try_keystroke(
+                &Keystroke::parse("ctrl-d").unwrap(),
+                false,
+                cx,
+            );
             assert!(success, "Should have registered ctrl-d sequence");
         });
 
@@ -3908,12 +3989,12 @@ mod tests {
 
         let first_event = event_rx.recv().await.expect("No wakeup event received");
 
-        terminal.update(cx, |terminal, _| {
-            terminal.input(b"false\r".to_vec());
+        terminal.update(cx, |terminal, cx| {
+            terminal.input(b"false\r".to_vec(), cx);
         });
         cx.executor().timer(Duration::from_millis(500)).await;
-        terminal.update(cx, |terminal, _| {
-            terminal.input(b"exit\r".to_vec());
+        terminal.update(cx, |terminal, cx| {
+            terminal.input(b"exit\r".to_vec(), cx);
         });
 
         let mut all_events = vec![first_event];
@@ -4223,7 +4304,7 @@ mod tests {
 
         let wrote = terminal.update(cx, |terminal, cx| {
             terminal.write_output(b"startup output\nprompt", cx);
-            terminal.input(b"user input".to_vec());
+            terminal.input(b"user input".to_vec(), cx);
             terminal.write_init_command_after_startup(b"agent\r".to_vec(), cx)
         });
         assert!(!wrote);
@@ -4433,6 +4514,48 @@ mod tests {
 
         let clipboard_text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(clipboard_text.as_deref(), Some("original"));
+    }
+
+    #[gpui::test]
+    async fn test_write_output_tracks_osc9_progress(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x1b\\", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _cx| terminal.progress()),
+            Some(TerminalProgress::Indeterminate)
+        );
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;1;64\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _cx| terminal.progress()),
+            Some(TerminalProgress::Normal(64))
+        );
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4\x1b\\", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _cx| terminal.progress()),
+            None
+        );
     }
 
     #[gpui::test]

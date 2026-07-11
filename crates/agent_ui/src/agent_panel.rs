@@ -86,13 +86,14 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
+use terminal::{Event as TerminalEvent, TerminalProgress, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -188,6 +189,8 @@ pub struct AgentPanelTerminalInfo {
     pub title: SharedString,
     pub created_at: DateTime<Utc>,
     pub has_notification: bool,
+    pub status: AgentThreadStatus,
+    pub completed_notification_pending: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
 }
@@ -734,8 +737,8 @@ pub fn init(cx: &mut App) {
                                     if !text.is_empty() {
                                         let view = agent_terminal.view.clone();
                                         view.update(cx, |view, cx| {
-                                            view.terminal().update(cx, |terminal, _| {
-                                                terminal.paste(&text);
+                                            view.terminal().update(cx, |terminal, cx| {
+                                                terminal.paste(&text, cx);
                                             });
                                             window.focus(&view.focus_handle(cx), cx);
                                         });
@@ -1000,10 +1003,39 @@ struct AgentTerminal {
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
     has_notification: bool,
+    status: AgentThreadStatus,
+    completed_notification_pending: bool,
+    attention_pending: bool,
+    last_input_generation: u64,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+fn terminal_progress_status(progress: TerminalProgress) -> AgentThreadStatus {
+    match progress {
+        TerminalProgress::Normal(_) | TerminalProgress::Indeterminate => AgentThreadStatus::Running,
+        TerminalProgress::Error(_) => AgentThreadStatus::Error,
+        TerminalProgress::Warning(_) => AgentThreadStatus::WaitingForConfirmation,
+    }
+}
+
+fn terminal_notification_is_completion(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "agent turn complete",
+        "turn completed",
+        "task complete",
+        "task completed",
+        "task done",
+        "claude finished",
+        "copilot finished",
+        "codex finished",
+        "turn ended",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 impl AgentTerminal {
@@ -2041,7 +2073,7 @@ impl AgentPanel {
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
         let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_agent_terminal_shell(working_directory, cx)
         });
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2190,21 +2222,40 @@ impl AgentPanel {
         let terminal_subscription = cx.subscribe_in(
             &terminal_entity,
             window,
-            move |this, _terminal, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::TitleChanged
-                | TerminalEvent::Wakeup
-                | TerminalEvent::BreadcrumbsChanged => {
+            move |this, terminal, event: &TerminalEvent, window, cx| {
+                let input_generation = terminal.read(cx).input_generation();
+                this.observe_terminal_input(terminal_id, input_generation, cx);
+                match event {
+                    TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
+                        this.refresh_terminal_metadata(terminal_id, cx);
+                        this.report_terminal_program(terminal_id, source, cx);
+                    }
+                TerminalEvent::Wakeup => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
-                TerminalEvent::CloseTerminal => {
-                    this.close_terminal_from_terminal_event(terminal_id, window, cx);
+                TerminalEvent::Bell => this.mark_terminal_attention(terminal_id, window, cx),
+                TerminalEvent::Notification(message) => {
+                    if terminal_notification_is_completion(message) {
+                        this.update_terminal_progress(terminal_id, None, window, cx);
+                        this.mark_terminal_notification(terminal_id, window, cx);
+                    } else {
+                        this.mark_terminal_attention(terminal_id, window, cx);
+                    }
                 }
+                    TerminalEvent::ProgressChanged => {
+                        let progress = terminal.read(cx).progress();
+                        this.update_terminal_progress(terminal_id, progress, window, cx);
+                    }
+                    TerminalEvent::CloseTerminal => {
+                        this.close_terminal_from_terminal_event(terminal_id, window, cx);
+                    }
                 TerminalEvent::BlinkChanged(_)
+                | TerminalEvent::Input
                 | TerminalEvent::SelectionsChanged
-                | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_) => {}
+                    | TerminalEvent::NewNavigationTarget(_)
+                    | TerminalEvent::Open(_) => {}
+                }
             },
         );
 
@@ -2222,6 +2273,13 @@ impl AgentPanel {
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
+            status: terminal_entity
+                .read(cx)
+                .progress()
+                .map_or(AgentThreadStatus::Completed, terminal_progress_status),
+            completed_notification_pending: false,
+            attention_pending: false,
+            last_input_generation: terminal_entity.read(cx).input_generation(),
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -2638,6 +2696,98 @@ impl AgentPanel {
                 cx,
             );
             self.show_terminal_notification(terminal_id, window, cx);
+        }
+    }
+
+    fn mark_terminal_attention(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.attention_pending = true;
+        if terminal.status != AgentThreadStatus::WaitingForConfirmation {
+            terminal.status = AgentThreadStatus::WaitingForConfirmation;
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
+        }
+        self.mark_terminal_notification(terminal_id, window, cx);
+    }
+
+    fn update_terminal_progress(
+        &mut self,
+        terminal_id: TerminalId,
+        progress: Option<TerminalProgress>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let status = progress.map_or(AgentThreadStatus::Completed, terminal_progress_status);
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if status == AgentThreadStatus::WaitingForConfirmation {
+            terminal.attention_pending = true;
+        }
+        if terminal.attention_pending && status == AgentThreadStatus::Running {
+            return;
+        }
+        if status != AgentThreadStatus::WaitingForConfirmation {
+            terminal.attention_pending = false;
+        }
+        let completed_notification_changed = status == AgentThreadStatus::Completed
+            && !terminal.completed_notification_pending;
+        terminal.completed_notification_pending = status == AgentThreadStatus::Completed;
+        let previous_status = terminal.status;
+        if previous_status == status && !completed_notification_changed {
+            return;
+        }
+        terminal.status = status;
+
+        if status == AgentThreadStatus::Running {
+            terminal.has_notification = false;
+            self.dismiss_terminal_notifications(terminal_id, cx);
+        } else if previous_status == AgentThreadStatus::Running
+            || matches!(
+                status,
+                AgentThreadStatus::WaitingForConfirmation | AgentThreadStatus::Error
+            )
+        {
+            self.mark_terminal_notification(terminal_id, window, cx);
+        }
+
+        cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
+    }
+
+    fn observe_terminal_input(
+        &mut self,
+        terminal_id: TerminalId,
+        input_generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.last_input_generation == input_generation {
+            return;
+        }
+        terminal.last_input_generation = input_generation;
+        if terminal.attention_pending {
+            terminal.attention_pending = false;
+            terminal.status = AgentThreadStatus::Running;
+            terminal.has_notification = false;
+            self.dismiss_terminal_notifications(terminal_id, cx);
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
+        } else if terminal.completed_notification_pending {
+            terminal.completed_notification_pending = false;
+            terminal.has_notification = false;
+            self.dismiss_terminal_notifications(terminal_id, cx);
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
         }
     }
 
@@ -3348,6 +3498,8 @@ impl AgentPanel {
                 title: terminal.title(cx),
                 created_at: terminal.created_at,
                 has_notification: terminal.has_notification,
+                status: terminal.status,
+                completed_notification_pending: terminal.completed_notification_pending,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
             })
@@ -6803,6 +6955,23 @@ impl AgentPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_terminal_notifications_conservatively() {
+        for notification in [
+            "Claude needs your attention",
+            "Claude is waiting for your input",
+            "Permission required: approve tool use",
+            "Question: choose an approach",
+            "Idle prompt notification",
+        ] {
+            assert!(!terminal_notification_is_completion(notification));
+        }
+        assert!(terminal_notification_is_completion("Agent turn complete"));
+        assert!(terminal_notification_is_completion("Claude finished"));
+        assert!(terminal_notification_is_completion("Task done"));
+        assert!(!terminal_notification_is_completion("Prompt completed? No"));
+    }
     use crate::NewWorktreeBranchTarget;
     use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
@@ -7479,7 +7648,10 @@ mod tests {
             let mut settings = AgentSettings::get_global(cx).clone();
             // `init_ran_42` is the command's output, not its echoed text, so finding
             // it proves the shell executed the command rather than just echoing it.
-            settings.terminal_init_command = Some("printf 'init_ran_%s\\n' 42".to_string());
+            settings.terminal_init_command = Some(
+                "printf 'init_ran_%s term_program=%s term_version=%s\\n' 42 \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\""
+                    .to_string(),
+            );
             AgentSettings::override_global(settings, cx);
 
             // Force a known POSIX shell so the test doesn't depend on the developer's login shell.
@@ -7522,7 +7694,7 @@ mod tests {
             if let Some(terminal) = &terminal
                 && terminal
                     .read_with(&cx, |terminal, _| terminal.get_content())
-                    .contains("init_ran_42")
+                    .contains("init_ran_42 term_program=ghostty term_version=1.2.0")
             {
                 break terminal.clone();
             }
@@ -7546,13 +7718,156 @@ mod tests {
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
         assert_eq!(
             input_log,
-            vec![b"printf 'init_ran_%s\\n' 42\r".to_vec()],
+            vec![b"printf 'init_ran_%s term_program=%s term_version=%s\\n' 42 \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\"\r".to_vec()],
             "init command should be written only after terminal startup has settled"
         );
         assert!(
             !terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()),
             "writing the init command must not mark the terminal as having received \
              user keyboard input"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_osc_statuses_and_attention_latching(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Claude", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+
+        let status = |panel: &Entity<AgentPanel>, cx: &TestAppContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal should remain in panel")
+                    .status
+            })
+        };
+        let completion_pending = |panel: &Entity<AgentPanel>, cx: &TestAppContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal should remain in panel")
+                    .completed_notification_pending
+            })
+        };
+
+        assert!(!completion_pending(&panel, &cx));
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;Permission required: approve tool use\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation,
+            "a repeated loading sequence must not hide a pending question"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.input(b"y\r".to_vec(), cx);
+            terminal.write_output(b"processing\r\n", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;4;50\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::WaitingForConfirmation);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation,
+            "a paused progress state must remain latched across repeated loading"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.input(b"y\r".to_vec(), cx);
+            terminal.write_output(b"processing\r\n", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;2;100\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Error);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;0\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Completed);
+        assert!(completion_pending(&panel, &cx));
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.input(b"next request\r".to_vec(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Completed);
+        assert!(
+            !completion_pending(&panel, &cx),
+            "terminal input should acknowledge the completed indicator without inventing loading"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;0\x07", cx);
+        });
+        cx.run_until_parked();
+        assert!(completion_pending(&panel, &cx));
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.paste("pasted request", cx);
+        });
+        cx.run_until_parked();
+        assert!(!completion_pending(&panel, &cx));
+        assert_eq!(status(&panel, &cx), AgentThreadStatus::Completed);
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
+            terminal.input(b"more input".to_vec(), cx);
+            terminal.write_output(b"more input\r\n", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::Running,
+            "input must not clear loading without an explicit completion signal"
         );
     }
 
@@ -10041,6 +10356,10 @@ mod tests {
                 .find(|terminal| terminal.id == first_terminal_id)
                 .expect("first terminal should remain in the panel");
             assert!(first_terminal.has_notification);
+            assert_eq!(
+                first_terminal.status,
+                AgentThreadStatus::WaitingForConfirmation
+            );
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10085,6 +10404,7 @@ mod tests {
                 .find(|terminal| terminal.id == terminal_id)
                 .expect("terminal should remain in the panel");
             assert!(!terminal.has_notification);
+            assert_eq!(terminal.status, AgentThreadStatus::WaitingForConfirmation);
         });
         assert!(
             cx.windows()

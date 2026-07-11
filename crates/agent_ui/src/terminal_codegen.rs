@@ -197,17 +197,17 @@ impl TerminalTransaction {
         let input = Self::sanitize_input(hunk);
         self.completion.push_str(&input);
         self.terminal
-            .update(cx, |terminal, _| terminal.input(input.into_bytes()));
+            .update(cx, |terminal, cx| terminal.input(input.into_bytes(), cx));
     }
 
     pub fn undo(self, cx: &mut App) {
         self.terminal
-            .update(cx, |terminal, _| terminal.input(CLEAR_INPUT.as_bytes()));
+            .update(cx, |terminal, cx| terminal.input(CLEAR_INPUT.as_bytes(), cx));
     }
 
     pub fn complete(self, cx: &mut App) {
         self.terminal
-            .update(cx, |terminal, _| terminal.input(CARRIAGE_RETURN.as_bytes()));
+            .update(cx, |terminal, cx| terminal.input(CARRIAGE_RETURN.as_bytes(), cx));
     }
 
     fn sanitize_input(mut input: String) -> String {

@@ -25,7 +25,7 @@ use alacritty_terminal::{
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
-        NamedPrivateMode, PrivateMode,
+        NamedPrivateMode, PrivateMode, Progress as AlacProgress,
     },
 };
 use anyhow::{Context as _, Result};
@@ -302,6 +302,14 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::MouseCursorDirty => Self::MouseCursorDirty,
             AlacTermEvent::Title(title) => Self::Title(title),
             AlacTermEvent::ResetTitle => Self::ResetTitle,
+            AlacTermEvent::Progress(progress) => Self::Progress(match progress {
+                AlacProgress::Remove => None,
+                AlacProgress::Set(value) => Some(crate::TerminalProgress::Normal(value)),
+                AlacProgress::Error(value) => Some(crate::TerminalProgress::Error(value)),
+                AlacProgress::Indeterminate => Some(crate::TerminalProgress::Indeterminate),
+                AlacProgress::Warning(value) => Some(crate::TerminalProgress::Warning(value)),
+            }),
+            AlacTermEvent::Notification(message) => Self::Notification(message),
             AlacTermEvent::ClipboardStore(_, data) => Self::ClipboardStore(data),
             AlacTermEvent::ClipboardLoad(_, format) => Self::ClipboardLoad(format),
             AlacTermEvent::ColorRequest(index, format) => Self::ColorRequest(index, format),
