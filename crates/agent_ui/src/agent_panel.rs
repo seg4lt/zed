@@ -2234,7 +2234,7 @@ impl AgentPanel {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_attention(terminal_id, window, cx),
+                TerminalEvent::Bell => this.mark_terminal_bell(terminal_id, window, cx),
                 TerminalEvent::Notification(message) => {
                     if terminal_notification_is_completion(message) {
                         this.update_terminal_progress(terminal_id, None, window, cx);
@@ -2715,6 +2715,23 @@ impl AgentPanel {
             cx.notify();
         }
         self.mark_terminal_notification(terminal_id, window, cx);
+    }
+
+    fn mark_terminal_bell(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let completion_pending = self
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| terminal.completed_notification_pending);
+        if completion_pending {
+            self.mark_terminal_notification(terminal_id, window, cx);
+        } else {
+            self.mark_terminal_attention(terminal_id, window, cx);
+        }
     }
 
     fn update_terminal_progress(
@@ -7834,6 +7851,17 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(status(&panel, &cx), AgentThreadStatus::Completed);
+        assert!(completion_pending(&panel, &cx));
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::Completed,
+            "a completion bell must not replace an explicit completed status with attention"
+        );
         assert!(completion_pending(&panel, &cx));
 
         terminal.update(&mut cx, |terminal, cx| {
