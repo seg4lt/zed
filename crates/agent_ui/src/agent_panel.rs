@@ -2794,7 +2794,7 @@ impl AgentPanel {
         terminal.last_input_generation = input_generation;
         if terminal.attention_pending {
             terminal.attention_pending = false;
-            terminal.status = AgentThreadStatus::Running;
+            terminal.status = AgentThreadStatus::Completed;
             terminal.has_notification = false;
             self.dismiss_terminal_notifications(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
@@ -7815,6 +7815,16 @@ mod tests {
             terminal.write_output(b"processing\r\n", cx);
         });
         cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::Completed,
+            "terminal input must not invent a loading state"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
+        });
+        cx.run_until_parked();
         assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
 
         terminal.update(&mut cx, |terminal, cx| {
@@ -7836,6 +7846,16 @@ mod tests {
         terminal.update(&mut cx, |terminal, cx| {
             terminal.input(b"y\r".to_vec(), cx);
             terminal.write_output(b"processing\r\n", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::Completed,
+            "terminal input must not invent a loading state"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx);
         });
         cx.run_until_parked();
         assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
