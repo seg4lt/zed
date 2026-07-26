@@ -18,7 +18,7 @@ use std::rc::Rc;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
-use zed_actions::agents_sidebar::ToggleThreadSwitcher;
+use zed_actions::agents_sidebar::{ToggleNavigator, ToggleThreadSwitcher};
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
@@ -135,6 +135,9 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     ) {
     }
 
+    /// Opens or closes the searchable sidebar navigator.
+    fn toggle_navigator(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Activates the next or previous project.
     fn cycle_project(&mut self, _forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
@@ -166,6 +169,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn to_any(&self) -> AnyView;
     fn entity_id(&self) -> EntityId;
     fn toggle_thread_switcher(&self, select_last: bool, window: &mut Window, cx: &mut App);
+    fn toggle_navigator(&self, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
 
@@ -224,6 +228,15 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.toggle_thread_switcher(select_last, window, cx);
+            });
+        });
+    }
+
+    fn toggle_navigator(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.toggle_navigator(window, cx);
             });
         });
     }
@@ -2211,6 +2224,13 @@ impl Render for MultiWorkspace {
                             }
                         },
                     ))
+                    .on_action(
+                        cx.listener(|this: &mut Self, _: &ToggleNavigator, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.toggle_navigator(window, cx);
+                            }
+                        }),
+                    )
                     .on_action(cx.listener(|this: &mut Self, _: &NextProject, window, cx| {
                         if let Some(sidebar) = &this.sidebar {
                             sidebar.cycle_project(true, window, cx);

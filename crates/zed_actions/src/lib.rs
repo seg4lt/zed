@@ -908,6 +908,8 @@ pub mod agents_sidebar {
         [
             /// Moves focus to the sidebar's search/filter editor.
             FocusSidebarFilter,
+            /// Opens the searchable projects, worktrees, threads, and terminals navigator.
+            ToggleNavigator,
         ]
     );
 }

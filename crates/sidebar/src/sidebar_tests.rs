@@ -812,6 +812,48 @@ async fn test_serialization_round_trip(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_toggle_navigator_opens_sidebar_as_modal(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.toggle_navigator(window, cx);
+    });
+    cx.run_until_parked();
+
+    let navigator = workspace
+        .read_with(cx, |workspace, cx| workspace.active_modal::<Sidebar>(cx))
+        .expect("navigator should be the active modal");
+    assert!(navigator.read_with(cx, |navigator, _| navigator.is_navigator()));
+    assert_eq!(
+        visible_entries_as_strings(&navigator, cx),
+        visible_entries_as_strings(&sidebar, cx),
+        "the navigator should use the sidebar's project and thread model"
+    );
+    assert!(
+        !visible_entries_as_strings(&navigator, cx).is_empty(),
+        "the navigator should contain the open project"
+    );
+
+    navigator.update_in(cx, |navigator, window, cx| {
+        navigator.selection = Some(0);
+        navigator.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        workspace
+            .read_with(cx, |workspace, cx| workspace.active_modal::<Sidebar>(cx))
+            .is_none(),
+        "confirming a navigator entry should activate it and dismiss the modal"
+    );
+}
+
+#[gpui::test]
 async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppContext) {
     // A regression test to ensure that restoring a serialized archive view does not panic.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;

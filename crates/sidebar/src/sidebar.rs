@@ -56,16 +56,16 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, SpinnerVariant, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    Scrollbars, SpinnerVariant, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip,
+    WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent, NextProject,
-    NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, SaveIntent,
-    Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
+    CloseWindow, FocusWorkspaceSidebar, ModalView, MultiWorkspace, MultiWorkspaceEvent,
+    NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey,
+    SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
     notifications::NotificationId, sidebar_side_context_menu,
 };
 
@@ -143,6 +143,12 @@ enum SidebarView {
     #[default]
     ThreadList,
     Archive(Entity<ThreadsArchiveView>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarPresentation {
+    Panel,
+    Navigator,
 }
 
 enum ArchiveWorktreeOutcome {
@@ -780,6 +786,7 @@ fn create_worktree_in_workspace(
 /// be computed from the current world state, compute it in the rebuild.
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
+    presentation: SidebarPresentation,
     width: Pixels,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
@@ -844,6 +851,23 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_presentation(multi_workspace, SidebarPresentation::Panel, window, cx)
+    }
+
+    fn new_navigator(
+        multi_workspace: Entity<MultiWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_presentation(multi_workspace, SidebarPresentation::Navigator, window, cx)
+    }
+
+    fn new_with_presentation(
+        multi_workspace: Entity<MultiWorkspace>,
+        presentation: SidebarPresentation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         cx.on_focus_in(&focus_handle, window, Self::focus_in)
             .detach();
@@ -852,7 +876,15 @@ impl Sidebar {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads…", window, cx);
+            editor.set_placeholder_text(
+                if presentation == SidebarPresentation::Navigator {
+                    "Search projects, worktrees, threads, and terminals…"
+                } else {
+                    "Search threads…"
+                },
+                window,
+                cx,
+            );
             editor
         });
         let thread_rename_editor = cx.new(|cx| Editor::single_line(window, cx));
@@ -935,6 +967,7 @@ impl Sidebar {
 
         Self {
             multi_workspace: multi_workspace.downgrade(),
+            presentation,
             width: DEFAULT_WIDTH,
             focus_handle,
             filter_editor,
@@ -2504,7 +2537,10 @@ impl Sidebar {
             })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if event.modifiers().secondary() {
+                    if this.is_navigator() {
+                        this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
+                        this.dismiss_navigator(cx);
+                    } else if event.modifiers().secondary() {
                         this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
                     } else if !this.has_filter_query(cx) {
                         this.toggle_collapse(&key_for_toggle, window, cx);
@@ -3337,7 +3373,22 @@ impl Sidebar {
         }
     }
 
+    fn is_navigator(&self) -> bool {
+        self.presentation == SidebarPresentation::Navigator
+    }
+
+    fn dismiss_navigator(&self, cx: &mut Context<Self>) {
+        if self.is_navigator() {
+            cx.emit(DismissEvent);
+        }
+    }
+
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_navigator() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
         if self.renaming_thread_id.is_some() {
             self.finish_thread_rename(window, cx);
             return;
@@ -3519,6 +3570,10 @@ impl Sidebar {
         if self.selection.is_none() {
             self.select_next(&SelectNext, window, cx);
         }
+        if self.is_navigator() && self.selection.is_some() {
+            self.confirm(&Confirm, window, cx);
+            return;
+        }
         if self.selection.is_some() {
             self.focus_handle.focus(window, cx);
         }
@@ -3587,14 +3642,19 @@ impl Sidebar {
         match entry {
             ListEntry::ProjectHeader { key, .. } => {
                 let key = key.clone();
-                self.toggle_collapse(&key, window, cx);
+                if self.is_navigator() {
+                    self.activate_or_open_workspace_for_group(&key, window, cx);
+                } else {
+                    self.toggle_collapse(&key, window, cx);
+                }
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
+                let focus = self.is_navigator();
                 match &thread.workspace {
                     ThreadEntryWorkspace::Open(workspace) => {
                         let workspace = workspace.clone();
-                        self.activate_thread(metadata, &workspace, false, window, cx);
+                        self.activate_thread(metadata, &workspace, focus, window, cx);
                     }
                     ThreadEntryWorkspace::Closed {
                         folder_paths,
@@ -3615,9 +3675,11 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
-                self.activate_terminal_entry(metadata, workspace, false, window, cx);
+                self.activate_terminal_entry(metadata, workspace, self.is_navigator(), window, cx);
             }
         }
+
+        self.dismiss_navigator(cx);
     }
 
     fn find_workspace_across_windows(
@@ -6497,9 +6559,10 @@ impl Sidebar {
                 let thread_workspace = thread_workspace.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.selection = None;
+                    let focus = this.is_navigator();
                     match &thread_workspace {
                         ThreadEntryWorkspace::Open(workspace) => {
-                            this.activate_thread(metadata.clone(), workspace, false, window, cx);
+                            this.activate_thread(metadata.clone(), workspace, focus, window, cx);
                         }
                         ThreadEntryWorkspace::Closed {
                             folder_paths,
@@ -6514,6 +6577,7 @@ impl Sidebar {
                             );
                         }
                     }
+                    this.dismiss_navigator(cx);
                 })
             });
 
@@ -6735,13 +6799,15 @@ impl Sidebar {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
                 move |this, _, window, cx| {
+                    let focus = this.is_navigator();
                     this.activate_terminal_entry(
                         metadata.clone(),
                         workspace.clone(),
-                        false,
+                        focus,
                         window,
                         cx,
                     );
+                    this.dismiss_navigator(cx);
                 }
             }))
             .into_any_element()
@@ -7460,7 +7526,11 @@ impl Sidebar {
     fn render_no_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
         let message = if has_query {
-            "No threads match your search."
+            if self.is_navigator() {
+                "No projects, worktrees, threads, or terminals match your search."
+            } else {
+                "No threads match your search."
+            }
         } else {
             "No threads yet"
         };
@@ -7476,6 +7546,79 @@ impl Sidebar {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+    }
+
+    fn render_thread_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let sticky_header = self.render_sticky_header(window, cx);
+        let no_search_results = self.contents.entries.is_empty();
+
+        v_flex()
+            .relative()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(Self::render_list_entry),
+                )
+                .flex_1()
+                .size_full(),
+            )
+            .when(no_search_results, |this| {
+                this.child(self.render_no_results(cx))
+            })
+            .when_some(sticky_header, |this, header| this.child(header))
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical).tracked_scroll_handle(&self.list_state),
+                window,
+                cx,
+            )
+            .into_any_element()
+    }
+
+    fn render_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let ui_font = theme_settings::setup_ui_font(window, cx);
+        let colors = cx.theme().colors();
+        let no_open_projects = !self.contents.has_open_projects;
+
+        v_flex()
+            .id("workspace-sidebar-navigator")
+            .key_context(self.dispatch_context(window, cx))
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::editor_move_down))
+            .on_action(cx.listener(Self::editor_move_up))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::collapse_selected_entry))
+            .on_action(cx.listener(Self::toggle_selected_fold))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::focus_sidebar_filter))
+            .font(ui_font)
+            .w(rems_from_px(680.))
+            .h(rems_from_px(560.))
+            .bg(colors.panel_background)
+            .elevation_3(cx)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .h_10()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(self.render_filter_input(cx)),
+            )
+            .map(|this| {
+                if no_open_projects {
+                    this.child(self.render_empty_state(cx))
+                } else {
+                    this.child(self.render_thread_list(window, cx))
+                }
+            })
+            .into_any_element()
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8012,6 +8155,19 @@ impl WorkspaceSidebar for Sidebar {
         self.toggle_thread_switcher_impl(select_last, window, cx);
     }
 
+    fn toggle_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspace = multi_workspace.read(cx).workspace().clone();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, {
+                let multi_workspace = multi_workspace.clone();
+                move |window, cx| Sidebar::new_navigator(multi_workspace, window, cx)
+            });
+        });
+    }
+
     fn cycle_project(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_project_impl(forward, window, cx);
     }
@@ -8052,6 +8208,9 @@ impl WorkspaceSidebar for Sidebar {
 }
 
 impl gpui::EventEmitter<workspace::SidebarEvent> for Sidebar {}
+impl gpui::EventEmitter<DismissEvent> for Sidebar {}
+
+impl ModalView for Sidebar {}
 
 impl Focusable for Sidebar {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -8061,9 +8220,12 @@ impl Focusable for Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_navigator() {
+            return self.render_navigator(window, cx);
+        }
+
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
         let ui_font = theme_settings::setup_ui_font(window, cx);
-        let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
         let bg = color
@@ -8071,7 +8233,6 @@ impl Render for Sidebar {
             .blend(color.panel_background.opacity(0.25));
 
         let no_open_projects = !self.contents.has_open_projects;
-        let no_search_results = self.contents.entries.is_empty();
 
         v_flex()
             .id("workspace-sidebar")
@@ -8118,30 +8279,7 @@ impl Render for Sidebar {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))
                         } else {
-                            this.child(
-                                v_flex()
-                                    .relative()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(
-                                        list(
-                                            self.list_state.clone(),
-                                            cx.processor(Self::render_list_entry),
-                                        )
-                                        .flex_1()
-                                        .size_full(),
-                                    )
-                                    .when(no_search_results, |this| {
-                                        this.child(self.render_no_results(cx))
-                                    })
-                                    .when_some(sticky_header, |this, header| this.child(header))
-                                    .custom_scrollbars(
-                                        Scrollbars::new(ScrollAxes::Vertical)
-                                            .tracked_scroll_handle(&self.list_state),
-                                        window,
-                                        cx,
-                                    ),
-                            )
+                            this.child(self.render_thread_list(window, cx))
                         }
                     }),
                 SidebarView::Archive(archive_view) => this.child(archive_view.clone()),
@@ -8162,6 +8300,7 @@ impl Render for Sidebar {
                 })
             })
             .child(self.render_sidebar_bottom_bar(cx))
+            .into_any_element()
     }
 }
 
