@@ -40,6 +40,58 @@ fn completed_terminal_uses_check_icon() {
     );
 }
 
+#[test]
+fn parses_structured_sidebar_filters() {
+    assert_eq!(
+        SidebarFilterQuery::parse(
+            "deploy ##project:'Long Project Name' ##status:'attention,loading'"
+        ),
+        SidebarFilterQuery {
+            text: "deploy".to_string(),
+            project: Some("Long Project Name".to_string()),
+            statuses: vec![SidebarStatusFilter::Attention, SidebarStatusFilter::Loading,],
+        }
+    );
+    assert_eq!(
+        SidebarFilterQuery::parse(r#"##status:done ##project:"zed" terminal"#),
+        SidebarFilterQuery {
+            text: "terminal".to_string(),
+            project: Some("zed".to_string()),
+            statuses: vec![SidebarStatusFilter::Done],
+        }
+    );
+    assert_eq!(
+        SidebarFilterQuery::parse("keep ##owner:'unknown'"),
+        SidebarFilterQuery {
+            text: "keep ##owner:'unknown'".to_string(),
+            project: None,
+            statuses: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn structured_status_filters_match_sidebar_states() {
+    assert!(SidebarStatusFilter::Loading.matches(AgentThreadStatus::Running, false));
+    assert!(SidebarStatusFilter::Done.matches(AgentThreadStatus::Completed, true));
+    assert!(!SidebarStatusFilter::Done.matches(AgentThreadStatus::Completed, false));
+    assert!(SidebarStatusFilter::Neutral.matches(AgentThreadStatus::Completed, false));
+    assert!(!SidebarStatusFilter::Neutral.matches(AgentThreadStatus::Completed, true));
+    assert!(
+        SidebarStatusFilter::Attention.matches(AgentThreadStatus::WaitingForConfirmation, false)
+    );
+    assert!(SidebarStatusFilter::Attention.matches(AgentThreadStatus::Error, false));
+    assert!(!SidebarStatusFilter::Done.matches(AgentThreadStatus::Running, false));
+    assert_eq!(
+        SidebarStatusFilter::parse("n"),
+        Some(SidebarStatusFilter::Neutral)
+    );
+    assert_eq!(
+        SidebarStatusFilter::parse("l"),
+        Some(SidebarStatusFilter::Loading)
+    );
+}
+
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
@@ -4117,6 +4169,22 @@ async fn test_search_narrows_visible_threads_to_matches(cx: &mut TestAppContext)
         ]
     );
 
+    type_in_search(&sidebar, "diff ##project:'m' ##status:n", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [my-project]",
+            "  Add inline diff view  <== selected",
+        ]
+    );
+
+    type_in_search(&sidebar, "##project:'other-project' ##status:neutral", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        Vec::<String>::new()
+    );
+
     // User changes query to something with no matches — list is empty.
     type_in_search(&sidebar, "nonexistent", cx);
     assert_eq!(
@@ -4531,8 +4599,21 @@ async fn test_search_then_keyboard_navigate_and_confirm(cx: &mut TestAppContext)
         ]
     );
 
-    // Selection starts on the first matching thread. User presses
-    // SelectNext to move to the second match.
+    // Selection starts on the first matching thread while the search editor
+    // still has focus. The first Down moves focus to that result without
+    // skipping it.
+    cx.dispatch_action(MoveDown);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [my-project]",
+            "  Fix crash in panel  <== selected",
+            "  Fix lint warnings",
+        ]
+    );
+
+    // Once the list has focus, the next Down advances to the second match.
     cx.dispatch_action(SelectNext);
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),

@@ -105,6 +105,161 @@ const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarStatusFilter {
+    Attention,
+    Done,
+    Loading,
+    Neutral,
+}
+
+impl SidebarStatusFilter {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            None
+        } else if "attention".starts_with(&value) {
+            Some(Self::Attention)
+        } else if "done".starts_with(&value) {
+            Some(Self::Done)
+        } else if "loading".starts_with(&value) {
+            Some(Self::Loading)
+        } else if "neutral".starts_with(&value) {
+            Some(Self::Neutral)
+        } else {
+            None
+        }
+    }
+
+    fn matches(self, status: AgentThreadStatus, completion_pending: bool) -> bool {
+        match self {
+            Self::Attention => matches!(
+                status,
+                AgentThreadStatus::WaitingForConfirmation | AgentThreadStatus::Error
+            ),
+            Self::Done => status == AgentThreadStatus::Completed && completion_pending,
+            Self::Loading => status == AgentThreadStatus::Running,
+            Self::Neutral => status == AgentThreadStatus::Completed && !completion_pending,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SidebarFilterQuery {
+    text: String,
+    project: Option<String>,
+    statuses: Vec<SidebarStatusFilter>,
+}
+
+impl SidebarFilterQuery {
+    fn parse(raw_query: &str) -> Self {
+        let mut parsed = Self::default();
+        let mut text = String::new();
+        let mut cursor = 0;
+
+        while let Some(relative_start) = raw_query[cursor..].find("##") {
+            let start = cursor + relative_start;
+            text.push_str(&raw_query[cursor..start]);
+
+            let Some((end, filter)) = parse_sidebar_filter_token(raw_query, start) else {
+                text.push_str("##");
+                cursor = start + 2;
+                continue;
+            };
+
+            match filter {
+                ParsedSidebarFilter::Project(project) => parsed.project = Some(project),
+                ParsedSidebarFilter::Statuses(statuses) => parsed.statuses.extend(statuses),
+            }
+            cursor = end;
+        }
+
+        text.push_str(&raw_query[cursor..]);
+        parsed.text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        parsed
+    }
+
+    fn is_active(&self) -> bool {
+        !self.text.is_empty() || self.project.is_some() || !self.statuses.is_empty()
+    }
+
+    fn matches_status(&self, status: AgentThreadStatus, completion_pending: bool) -> bool {
+        self.statuses.is_empty()
+            || self
+                .statuses
+                .iter()
+                .any(|filter| filter.matches(status, completion_pending))
+    }
+}
+
+enum ParsedSidebarFilter {
+    Project(String),
+    Statuses(Vec<SidebarStatusFilter>),
+}
+
+fn parse_sidebar_filter_token(query: &str, start: usize) -> Option<(usize, ParsedSidebarFilter)> {
+    let bytes = query.as_bytes();
+    let mut cursor = start.checked_add(2)?;
+    let key_start = cursor;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphabetic())
+    {
+        cursor += 1;
+    }
+    let key = query.get(key_start..cursor)?;
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+
+    let quote = bytes
+        .get(cursor)
+        .copied()
+        .filter(|byte| matches!(byte, b'\'' | b'"'));
+    if quote.is_some() {
+        cursor += 1;
+    }
+    let value_start = cursor;
+    if let Some(quote) = quote {
+        while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&quote) {
+            return None;
+        }
+    } else {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+    }
+
+    let value = query.get(value_start..cursor)?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if quote.is_some() {
+        cursor += 1;
+    }
+
+    let filter = if key.eq_ignore_ascii_case("project") {
+        ParsedSidebarFilter::Project(value.to_string())
+    } else if key.eq_ignore_ascii_case("status") {
+        let statuses = value
+            .split(',')
+            .map(SidebarStatusFilter::parse)
+            .collect::<Option<Vec<_>>>()?;
+        ParsedSidebarFilter::Statuses(statuses)
+    } else {
+        return None;
+    };
+
+    Some((cursor, filter))
+}
+
 fn terminal_status_icon(
     status: AgentThreadStatus,
     completed_notification_pending: bool,
@@ -1431,7 +1586,7 @@ impl Sidebar {
             .first()
             .map(|ws| ws.read(cx).project().read(cx).agent_server_store().clone());
 
-        let query = self.filter_editor.read(cx).text(cx);
+        let query = SidebarFilterQuery::parse(&self.filter_editor.read(cx).text(cx));
 
         let previous = mem::take(&mut self.contents);
 
@@ -1635,7 +1790,7 @@ impl Sidebar {
             let label = group_key.display_name(&path_detail_map);
 
             let is_collapsed = self.is_group_collapsed(group_key, cx);
-            let should_load_threads = !is_collapsed || !query.is_empty();
+            let should_load_threads = !is_collapsed || query.is_active();
 
             let is_active = active_workspace
                 .as_ref()
@@ -1906,33 +2061,51 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
-            if !query.is_empty() {
-                let workspace_highlight_positions =
-                    fuzzy_match_positions(&query, &label).unwrap_or_default();
-                let workspace_matched = !workspace_highlight_positions.is_empty();
+            if query.is_active() {
+                let project_highlight_positions = query
+                    .project
+                    .as_ref()
+                    .and_then(|project| fuzzy_match_positions(project, &label));
+                let project_matched =
+                    query.project.is_none() || project_highlight_positions.is_some();
+                let text_is_empty = query.text.is_empty();
+                let text_workspace_highlight_positions = if text_is_empty {
+                    Vec::new()
+                } else {
+                    fuzzy_match_positions(&query.text, &label).unwrap_or_default()
+                };
+                let workspace_text_matched =
+                    text_is_empty || !text_workspace_highlight_positions.is_empty();
 
                 let mut matched_threads: Vec<Arc<ThreadEntry>> = Vec::new();
                 for mut thread in threads {
                     let mut worktree_matched = false;
+                    let mut title_matched = false;
                     {
                         let thread = Arc::make_mut(&mut thread);
-                        let title = thread.metadata.display_title();
-                        if let Some(positions) = fuzzy_match_positions(&query, title.as_ref()) {
-                            thread.highlight_positions = positions;
-                        }
-                        for worktree in &mut thread.worktrees {
-                            let Some(name) = worktree.worktree_name.as_ref() else {
-                                continue;
-                            };
-                            if let Some(positions) = fuzzy_match_positions(&query, name) {
-                                worktree.highlight_positions = positions;
-                                worktree_matched = true;
+                        if !text_is_empty {
+                            let title = thread.metadata.display_title();
+                            if let Some(positions) =
+                                fuzzy_match_positions(&query.text, title.as_ref())
+                            {
+                                thread.highlight_positions = positions;
+                                title_matched = true;
+                            }
+                            for worktree in &mut thread.worktrees {
+                                let Some(name) = worktree.worktree_name.as_ref() else {
+                                    continue;
+                                };
+                                if let Some(positions) = fuzzy_match_positions(&query.text, name) {
+                                    worktree.highlight_positions = positions;
+                                    worktree_matched = true;
+                                }
                             }
                         }
                     }
-                    if workspace_matched
-                        || !thread.highlight_positions.is_empty()
-                        || worktree_matched
+                    if query.matches_status(
+                        thread.status,
+                        notified_threads.contains(&thread.metadata.thread_id),
+                    ) && (workspace_text_matched || title_matched || worktree_matched)
                     {
                         matched_threads.push(thread);
                     }
@@ -1941,31 +2114,47 @@ impl Sidebar {
                 let mut matched_terminals: Vec<TerminalEntry> = Vec::new();
                 for mut terminal in terminals {
                     let mut terminal_matched = false;
-                    let terminal_title = terminal.metadata.display_title();
-                    if let Some(positions) = fuzzy_match_positions(&query, terminal_title.as_ref())
-                    {
-                        terminal.highlight_positions = positions;
-                        terminal_matched = true;
-                    }
                     let mut worktree_matched = false;
-                    for worktree in &mut terminal.worktrees {
-                        let Some(name) = worktree.worktree_name.as_ref() else {
-                            continue;
-                        };
-                        if let Some(positions) = fuzzy_match_positions(&query, name) {
-                            worktree.highlight_positions = positions;
-                            worktree_matched = true;
+                    if !text_is_empty {
+                        let terminal_title = terminal.metadata.display_title();
+                        if let Some(positions) =
+                            fuzzy_match_positions(&query.text, terminal_title.as_ref())
+                        {
+                            terminal.highlight_positions = positions;
+                            terminal_matched = true;
+                        }
+                        for worktree in &mut terminal.worktrees {
+                            let Some(name) = worktree.worktree_name.as_ref() else {
+                                continue;
+                            };
+                            if let Some(positions) = fuzzy_match_positions(&query.text, name) {
+                                worktree.highlight_positions = positions;
+                                worktree_matched = true;
+                            }
                         }
                     }
-                    if workspace_matched || terminal_matched || worktree_matched {
+                    if query
+                        .matches_status(terminal.status, terminal.completed_notification_pending)
+                        && (workspace_text_matched || terminal_matched || worktree_matched)
+                    {
                         matched_terminals.push(terminal);
                     }
                 }
 
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
+                let has_matching_children =
+                    !matched_threads.is_empty() || !matched_terminals.is_empty();
+                if !project_matched
+                    || (!has_matching_children
+                        && (!workspace_text_matched || !query.statuses.is_empty()))
                 {
                     continue;
                 }
+
+                let mut workspace_highlight_positions =
+                    project_highlight_positions.unwrap_or_default();
+                workspace_highlight_positions.extend(text_workspace_highlight_positions);
+                workspace_highlight_positions.sort_unstable();
+                workspace_highlight_positions.dedup();
 
                 // Check for notifications: threads that completed while not active.
                 let has_thread_notifications = matched_threads
@@ -3553,6 +3742,11 @@ impl Sidebar {
     }
 
     fn editor_move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() && self.filter_editor.read(cx).is_focused(window) {
+            self.focus_handle.focus(window, cx);
+            return;
+        }
+
         self.select_next(&SelectNext, window, cx);
         if self.selection.is_some() {
             self.focus_handle.focus(window, cx);
