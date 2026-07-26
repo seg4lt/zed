@@ -128,7 +128,9 @@ impl WorktreePicker {
             focused_dock,
             current_branch_name,
             default_branch: None,
+            local_branches: Vec::new(),
             remote_branches: Vec::new(),
+            mode: WorktreePickerMode::Browse,
             has_multiple_repositories,
             focus_handle: cx.focus_handle(),
             show_footer,
@@ -142,6 +144,7 @@ impl WorktreePicker {
             Picker::list(delegate, window, cx)
                 .list_measure_all()
                 .show_scrollbar(true)
+                .initial_width(rems(42.))
                 .embedded()
         });
 
@@ -187,19 +190,28 @@ impl WorktreePicker {
                     None => None,
                 };
 
-                let remote_branches = match branches_request {
+                let (local_branches, remote_branches) = match branches_request {
                     Some(request) => request
                         .await
                         .ok()
                         .and_then(Result::ok)
                         .map(|scan| {
-                            scan.branches
-                                .into_iter()
-                                .filter_map(|branch| RemoteBranchName::parse(&branch.ref_name))
-                                .collect()
+                            let mut local_branches = Vec::new();
+                            let mut remote_branches = Vec::new();
+                            for branch in scan.branches {
+                                if branch.is_remote() {
+                                    if let Some(branch) = RemoteBranchName::parse(&branch.ref_name)
+                                    {
+                                        remote_branches.push(branch);
+                                    }
+                                } else {
+                                    local_branches.push(branch.name().to_string());
+                                }
+                            }
+                            (local_branches, remote_branches)
                         })
                         .unwrap_or_default(),
-                    None => Vec::new(),
+                    None => (Vec::new(), Vec::new()),
                 };
 
                 picker_handle.update_in(cx, |picker, window, cx| {
@@ -207,6 +219,7 @@ impl WorktreePicker {
                     picker.delegate.worktree_repositories = worktree_repositories;
                     picker.delegate.default_branch =
                         default_branch.and_then(|branch| RemoteBranchName::parse(&branch));
+                    picker.delegate.local_branches = local_branches;
                     picker.delegate.remote_branches = remote_branches;
                     picker.delegate.refresh_project_worktree_paths(window, cx);
                     picker.refresh(window, cx);
@@ -340,7 +353,25 @@ enum WorktreeEntry {
     CreateNamed {
         name: String,
         from_branch: Option<RemoteBranchName>,
+        is_existing_local_branch: bool,
         disabled_reason: Option<String>,
+    },
+    CreateWithWorktreeName {
+        worktree_name: Option<String>,
+        branch_name: String,
+        from_branch: Option<RemoteBranchName>,
+        is_existing_local_branch: bool,
+        disabled_reason: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+enum WorktreePickerMode {
+    Browse,
+    NameWorktree {
+        branch_name: String,
+        from_branch: Option<RemoteBranchName>,
+        is_existing_local_branch: bool,
     },
 }
 
@@ -356,7 +387,9 @@ struct WorktreePickerDelegate {
     focused_dock: Option<DockPosition>,
     current_branch_name: Option<String>,
     default_branch: Option<RemoteBranchName>,
+    local_branches: Vec<String>,
     remote_branches: Vec<RemoteBranchName>,
+    mode: WorktreePickerMode,
     has_multiple_repositories: bool,
     focus_handle: FocusHandle,
     show_footer: bool,
@@ -741,7 +774,12 @@ impl PickerDelegate for WorktreePickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Select or type to create a worktree…".into()
+        match &self.mode {
+            WorktreePickerMode::Browse => "Select or type to create a worktree…".into(),
+            WorktreePickerMode::NameWorktree { .. } => {
+                "Name the worktree, or leave blank for a generated name…".into()
+            }
+        }
     }
 
     fn editor_position(&self) -> PickerEditorPosition {
@@ -781,30 +819,66 @@ impl PickerDelegate for WorktreePickerDelegate {
         let repo_worktrees = self.all_repo_worktrees().to_vec();
 
         let normalized_query = query.replace(' ', "-");
-        let main_worktree_path = self
-            .all_worktrees
-            .iter()
-            .find(|wt| wt.is_main)
-            .map(|wt| wt.path.clone());
-        let has_named_worktree = self.all_worktrees.iter().any(|worktree| {
-            worktree.directory_name(main_worktree_path.as_deref()) == normalized_query
-        });
-        let create_named_disabled_reason: Option<String> = if self.has_multiple_repositories {
-            Some("Cannot create a named worktree in a project with multiple repositories".into())
-        } else if has_named_worktree {
-            Some("A worktree with this name already exists".into())
-        } else {
-            None
-        };
+        if let WorktreePickerMode::NameWorktree {
+            branch_name,
+            from_branch,
+            is_existing_local_branch,
+        } = &self.mode
+        {
+            let worktree_name = (!normalized_query.is_empty()).then_some(normalized_query.clone());
+            let main_worktree_path = self
+                .all_worktrees
+                .iter()
+                .find(|worktree| worktree.is_main)
+                .map(|worktree| worktree.path.as_path());
+            let has_named_worktree = worktree_name.as_ref().is_some_and(|worktree_name| {
+                self.all_worktrees
+                    .iter()
+                    .any(|worktree| worktree.directory_name(main_worktree_path) == *worktree_name)
+            });
+            let disabled_reason = if self.has_multiple_repositories && worktree_name.is_some() {
+                Some(
+                    "Cannot create a named worktree in a project with multiple repositories".into(),
+                )
+            } else if has_named_worktree {
+                Some("A worktree with this name already exists".into())
+            } else {
+                None
+            };
+
+            self.matches = vec![WorktreeEntry::CreateWithWorktreeName {
+                worktree_name,
+                branch_name: branch_name.clone(),
+                from_branch: from_branch.clone(),
+                is_existing_local_branch: *is_existing_local_branch,
+                disabled_reason,
+            }];
+            self.selected_index = 0;
+            return Task::ready(());
+        }
+
+        let create_named_disabled_reason: Option<String> = None;
 
         let show_default_branch_create =
             !self.has_multiple_repositories && self.default_branch.is_some();
         let default_branch = self.default_branch.clone();
-        let matching_remote_branch = self
+        let matching_local_branches = self
+            .local_branches
+            .iter()
+            .filter(|branch| branch.contains(&normalized_query))
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>();
+        let matching_remote_branches = self
             .remote_branches
             .iter()
-            .find(|branch| branch.branch_name == normalized_query)
-            .cloned();
+            .filter(|branch| {
+                branch.branch_name.contains(&normalized_query)
+                    || branch.display_name().contains(&normalized_query)
+            })
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>();
 
         if query.is_empty() {
             let mut matches = self.build_fixed_entries();
@@ -912,24 +986,38 @@ impl PickerDelegate for WorktreePickerDelegate {
                     if !new_matches.is_empty() {
                         new_matches.push(WorktreeEntry::Separator);
                     }
-                    if let Some(remote_branch) = matching_remote_branch {
+                    let has_matching_branch =
+                        !matching_local_branches.is_empty() || !matching_remote_branches.is_empty();
+                    for local_branch in matching_local_branches {
                         new_matches.push(WorktreeEntry::CreateNamed {
-                            name: normalized_query.clone(),
-                            from_branch: Some(remote_branch),
+                            name: local_branch,
+                            from_branch: None,
+                            is_existing_local_branch: true,
                             disabled_reason: create_named_disabled_reason.clone(),
                         });
-                    } else if show_default_branch_create {
+                    }
+                    for remote_branch in matching_remote_branches {
+                        new_matches.push(WorktreeEntry::CreateNamed {
+                            name: remote_branch.branch_name.clone(),
+                            from_branch: Some(remote_branch),
+                            is_existing_local_branch: false,
+                            disabled_reason: create_named_disabled_reason.clone(),
+                        });
+                    }
+                    if !has_matching_branch && show_default_branch_create {
                         if let Some(ref default_branch) = default_branch {
                             new_matches.push(WorktreeEntry::CreateNamed {
                                 name: normalized_query.clone(),
                                 from_branch: Some(default_branch.clone()),
+                                is_existing_local_branch: false,
                                 disabled_reason: create_named_disabled_reason.clone(),
                             });
                         }
-                    } else {
+                    } else if !has_matching_branch {
                         new_matches.push(WorktreeEntry::CreateNamed {
                             name: normalized_query.clone(),
                             from_branch: None,
+                            is_existing_local_branch: false,
                             disabled_reason: create_named_disabled_reason.clone(),
                         });
                     }
@@ -1032,10 +1120,33 @@ impl PickerDelegate for WorktreePickerDelegate {
             WorktreeEntry::CreateNamed {
                 name,
                 from_branch,
+                is_existing_local_branch,
+                disabled_reason: None,
+            } => {
+                self.mode = WorktreePickerMode::NameWorktree {
+                    branch_name: name.clone(),
+                    from_branch: from_branch.clone(),
+                    is_existing_local_branch: *is_existing_local_branch,
+                };
+                self.matches.clear();
+                self.selected_index = 0;
+                cx.defer_in(window, |picker, window, cx| {
+                    picker.set_query("", window, cx);
+                    picker.refresh_placeholder(window, cx);
+                    picker.refresh(window, cx);
+                    cx.notify();
+                });
+                return;
+            }
+            WorktreeEntry::CreateWithWorktreeName {
+                worktree_name,
+                branch_name,
+                from_branch,
+                is_existing_local_branch: _,
                 disabled_reason: None,
             } => {
                 let branch_target = NewWorktreeBranchTarget::NewBranch {
-                    name: name.clone(),
+                    name: branch_name.clone(),
                     remote_name: from_branch
                         .as_ref()
                         .map(|branch| branch.remote_name.clone()),
@@ -1048,7 +1159,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                         crate::worktree_service::handle_create_worktree(
                             workspace,
                             &CreateWorktree {
-                                worktree_name: Some(name.clone()),
+                                worktree_name: worktree_name.clone(),
                                 branch_target,
                             },
                             window,
@@ -1059,6 +1170,10 @@ impl PickerDelegate for WorktreePickerDelegate {
                 }
             }
             WorktreeEntry::CreateNamed {
+                disabled_reason: Some(_),
+                ..
+            }
+            | WorktreeEntry::CreateWithWorktreeName {
                 disabled_reason: Some(_),
                 ..
             } => {
@@ -1330,6 +1445,7 @@ impl PickerDelegate for WorktreePickerDelegate {
             WorktreeEntry::CreateNamed {
                 name,
                 from_branch,
+                is_existing_local_branch,
                 disabled_reason,
             } => {
                 let branch_label = from_branch
@@ -1340,14 +1456,57 @@ impl PickerDelegate for WorktreePickerDelegate {
                             .clone()
                             .unwrap_or_else(|| "HEAD".to_string())
                     });
-                let label = format!("Create \"{name}\" based on {branch_label}");
-                let element_id = match from_branch {
-                    Some(branch) => format!("create-named-from-{}", branch.display_name()),
-                    None => "create-named-from-current".to_string(),
+                let label = if *is_existing_local_branch {
+                    format!("Create worktree from local branch {name}")
+                } else {
+                    format!("Create worktree for \"{name}\" based on {branch_label}")
+                };
+                let element_id = if *is_existing_local_branch {
+                    format!("create-named-from-local-{name}")
+                } else if let Some(branch) = from_branch {
+                    format!("create-named-from-{}", branch.display_name())
+                } else {
+                    "create-named-from-current".to_string()
                 };
 
                 let item = create_new_list_item(
                     element_id.into(),
+                    label.into(),
+                    disabled_reason.clone().map(SharedString::from),
+                    selected,
+                );
+
+                Some(item.into_any_element())
+            }
+            WorktreeEntry::CreateWithWorktreeName {
+                worktree_name,
+                branch_name,
+                from_branch,
+                is_existing_local_branch,
+                disabled_reason,
+            } => {
+                let branch_label = from_branch
+                    .as_ref()
+                    .map(RemoteBranchName::display_name)
+                    .unwrap_or_else(|| {
+                        self.current_branch_name
+                            .clone()
+                            .unwrap_or_else(|| "HEAD".to_string())
+                    });
+                let branch_description = if *is_existing_local_branch {
+                    format!("local branch \"{branch_name}\"")
+                } else {
+                    format!("branch \"{branch_name}\" based on {branch_label}")
+                };
+                let label = match worktree_name {
+                    Some(worktree_name) => {
+                        format!("Create worktree \"{worktree_name}\" for {branch_description}")
+                    }
+                    None => format!("Create worktree with generated name for {branch_description}"),
+                };
+
+                let item = create_new_list_item(
+                    "create-with-worktree-name".into(),
                     label.into(),
                     disabled_reason.clone().map(SharedString::from),
                     selected,
@@ -1372,6 +1531,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                 WorktreeEntry::CreateFromCurrentBranch
                     | WorktreeEntry::CreateFromDefaultBranch { .. }
                     | WorktreeEntry::CreateNamed { .. }
+                    | WorktreeEntry::CreateWithWorktreeName { .. }
             )
         });
 
@@ -1488,6 +1648,7 @@ fn create_new_list_item(
         .child(
             h_flex()
                 .w_full()
+                .min_w_0()
                 .gap_2p5()
                 .child(
                     Icon::new(IconName::Plus)
@@ -1500,7 +1661,11 @@ fn create_new_list_item(
                         })
                         .size(IconSize::Small),
                 )
-                .child(Label::new(label).when(is_disabled, |this| this.color(Color::Disabled))),
+                .child(
+                    Label::new(label)
+                        .flex_1()
+                        .when(is_disabled, |this| this.color(Color::Disabled)),
+                ),
         )
         .when_some(disabled_tooltip, |this, reason| {
             this.tooltip(Tooltip::text(reason))
@@ -1848,6 +2013,149 @@ mod tests {
                     }
                     _ => panic!("named worktree creation should prefer the remote default branch"),
                 })
+        });
+    }
+
+    #[gpui::test]
+    async fn test_named_worktree_can_use_a_different_name_than_its_branch(cx: &mut TestAppContext) {
+        let (_fs, worktree_picker, _repository, _worktree_path, mut cx) =
+            init_worktree_picker_test(cx).await;
+        let remote_branch = RemoteBranchName {
+            remote_name: "origin".to_string(),
+            branch_name: "feature/long-branch-name".to_string(),
+        };
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                picker.delegate.local_branches = vec!["feature/long-branch-name".to_string()];
+                picker.delegate.remote_branches = vec![remote_branch.clone()];
+                picker.delegate.has_multiple_repositories = true;
+            })
+        });
+
+        let update_matches = worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker.delegate.update_matches(
+                    "origin/feature/long-branch-name".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        update_matches.await;
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                assert!(picker.delegate.matches.iter().any(|entry| matches!(
+                    entry,
+                    WorktreeEntry::CreateNamed {
+                        name,
+                        from_branch: Some(from_branch),
+                        disabled_reason: None,
+                        ..
+                    } if name == "feature/long-branch-name" && from_branch == &remote_branch
+                )));
+            })
+        });
+
+        let update_matches = worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker
+                    .delegate
+                    .update_matches("feature/long-branch-name".to_string(), window, cx)
+            })
+        });
+        update_matches.await;
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                assert!(picker.delegate.matches.iter().any(|entry| matches!(
+                    entry,
+                    WorktreeEntry::CreateNamed {
+                        name,
+                        from_branch: None,
+                        is_existing_local_branch: true,
+                        ..
+                    } if name == "feature/long-branch-name"
+                )));
+                assert!(picker.delegate.matches.iter().any(|entry| matches!(
+                    entry,
+                    WorktreeEntry::CreateNamed {
+                        name,
+                        from_branch: Some(from_branch),
+                        is_existing_local_branch: false,
+                        ..
+                    } if name == "feature/long-branch-name" && from_branch == &remote_branch
+                )));
+            })
+        });
+
+        worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                let create_index = picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .position(|entry| {
+                        matches!(
+                            entry,
+                            WorktreeEntry::CreateNamed {
+                                from_branch: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .expect("remote branch create entry should be present");
+                picker.delegate.selected_index = create_index;
+                picker.delegate.confirm(false, window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                assert!(picker.query(cx).is_empty());
+                assert!(matches!(
+                    picker.delegate.matches.first(),
+                    Some(WorktreeEntry::CreateWithWorktreeName {
+                        worktree_name: None,
+                        branch_name,
+                        from_branch: Some(from_branch),
+                        disabled_reason: None,
+                        ..
+                    }) if branch_name == "feature/long-branch-name"
+                        && from_branch == &remote_branch
+                ));
+                picker.delegate.has_multiple_repositories = false;
+            })
+        });
+
+        let update_matches = worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker
+                    .delegate
+                    .update_matches("short-worktree-name".to_string(), window, cx)
+            })
+        });
+        update_matches.await;
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                assert!(matches!(
+                    picker.delegate.matches.first(),
+                    Some(WorktreeEntry::CreateWithWorktreeName {
+                        worktree_name: Some(worktree_name),
+                        branch_name,
+                        from_branch: Some(from_branch),
+                        disabled_reason: None,
+                        ..
+                    }) if worktree_name == "short-worktree-name"
+                        && branch_name == "feature/long-branch-name"
+                        && from_branch == &remote_branch
+                ));
+            })
         });
     }
 
