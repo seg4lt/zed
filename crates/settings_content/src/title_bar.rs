@@ -81,6 +81,11 @@ impl From<String> for WindowButtonLayoutContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct TitleBarSettingsContent {
+    /// Whether to show the title bar and window controls.
+    ///
+    /// Default: true
+    #[serde(rename = "experimental.show")]
+    pub show: Option<bool>,
     /// Whether to show git status indicators on the branch icon in the title bar.
     /// When enabled, the branch icon changes to reflect the current repository
     /// status (e.g. modified, added, deleted, or conflict).

@@ -225,6 +225,12 @@ impl Render for TitleBar {
         }
 
         let title_bar_settings = *TitleBarSettings::get_global(cx);
+        #[cfg(target_os = "macos")]
+        window.set_traffic_lights_visible(title_bar_settings.show);
+        if !title_bar_settings.show {
+            return div().into_any_element();
+        }
+
         let button_layout = title_bar_settings.button_layout;
         let is_git_enabled = ProjectSettings::get_global(cx).git.enabled.status;
 
@@ -480,6 +486,7 @@ impl TitleBar {
             }),
         );
         subscriptions.push(cx.observe(&user_store, |_a, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|_, cx| cx.notify()));
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             subscriptions.push(cx.subscribe(
                 &workspace_entity,

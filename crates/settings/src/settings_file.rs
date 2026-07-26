@@ -176,7 +176,10 @@ pub fn watch_config_file(
     let (tx, rx) = mpsc::unbounded();
     let task = executor.spawn(async move {
         let path = fs.canonicalize(&path).await.unwrap_or_else(|_| path);
-        let (events, _) = fs.watch(&path, Duration::from_millis(100)).await;
+        // Editors commonly save by replacing the file, which can invalidate a
+        // native watcher attached directly to the old file.
+        let watch_path = path.parent().unwrap_or(&path);
+        let (events, _) = fs.watch(watch_path, Duration::from_millis(100)).await;
         futures::pin_mut!(events);
 
         let contents = fs.load(&path).await.unwrap_or_default();

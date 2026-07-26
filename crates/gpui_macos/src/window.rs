@@ -505,6 +505,7 @@ struct MacWindowState {
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
     traffic_light_frames: Option<TrafficLightFrames>,
+    traffic_lights_visible: bool,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
@@ -527,6 +528,8 @@ struct MacWindowState {
 
 impl MacWindowState {
     fn move_traffic_light(&mut self) {
+        self.update_traffic_light_visibility();
+
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
                 self.restore_traffic_light();
@@ -584,6 +587,17 @@ impl MacWindowState {
                 buttons.zoom.updateTrackingAreas();
             }
         }
+    }
+
+    fn update_traffic_light_visibility(&self) {
+        let Some(buttons) = self.traffic_light_buttons() else {
+            return;
+        };
+
+        let hidden = !self.traffic_lights_visible || self.is_fullscreen();
+        buttons.close.setHidden(hidden);
+        buttons.minimize.setHidden(hidden);
+        buttons.zoom.setHidden(hidden);
     }
 
     fn capture_traffic_light_frames(&self) -> Option<TrafficLightFrames> {
@@ -901,6 +915,7 @@ impl MacWindow {
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 traffic_light_frames: None,
+                traffic_lights_visible: true,
                 transparent_titlebar: titlebar
                     .as_ref()
                     .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -1281,6 +1296,12 @@ impl PlatformWindow for MacWindow {
         let mut state = self.0.lock();
         state.traffic_light_position = Some(position);
         state.move_traffic_light();
+    }
+
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        let mut state = self.0.lock();
+        state.traffic_lights_visible = visible;
+        state.update_traffic_light_visibility();
     }
 
     fn scale_factor(&self) -> f32 {
