@@ -1225,7 +1225,7 @@ fn subscribe_for_terminal_events(
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
                 Event::ProgressChanged => cx.emit(ItemEvent::UpdateTab),
-                Event::Notification(_) | Event::Input => {}
+                Event::Notification(_) | Event::Input { .. } => {}
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();

@@ -2222,14 +2222,11 @@ impl AgentPanel {
         let terminal_subscription = cx.subscribe_in(
             &terminal_entity,
             window,
-            move |this, terminal, event: &TerminalEvent, window, cx| {
-                let input_generation = terminal.read(cx).input_generation();
-                this.observe_terminal_input(terminal_id, input_generation, cx);
-                match event {
-                    TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
-                        this.refresh_terminal_metadata(terminal_id, cx);
-                        this.report_terminal_program(terminal_id, source, cx);
-                    }
+            move |this, terminal, event: &TerminalEvent, window, cx| match event {
+                TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
+                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.report_terminal_program(terminal_id, source, cx);
+                }
                 TerminalEvent::Wakeup => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
@@ -2243,19 +2240,23 @@ impl AgentPanel {
                         this.mark_terminal_attention(terminal_id, window, cx);
                     }
                 }
-                    TerminalEvent::ProgressChanged => {
-                        let progress = terminal.read(cx).progress();
-                        this.update_terminal_progress(terminal_id, progress, window, cx);
-                    }
-                    TerminalEvent::CloseTerminal => {
-                        this.close_terminal_from_terminal_event(terminal_id, window, cx);
-                    }
-                TerminalEvent::BlinkChanged(_)
-                | TerminalEvent::Input
-                | TerminalEvent::SelectionsChanged
-                    | TerminalEvent::NewNavigationTarget(_)
-                    | TerminalEvent::Open(_) => {}
+                TerminalEvent::ProgressChanged => {
+                    let progress = terminal.read(cx).progress();
+                    this.update_terminal_progress(terminal_id, progress, window, cx);
                 }
+                TerminalEvent::Input { submitted } => {
+                    if *submitted {
+                        let input_generation = terminal.read(cx).input_generation();
+                        this.observe_terminal_input(terminal_id, input_generation, cx);
+                    }
+                }
+                TerminalEvent::CloseTerminal => {
+                    this.close_terminal_from_terminal_event(terminal_id, window, cx);
+                }
+                TerminalEvent::BlinkChanged(_)
+                | TerminalEvent::SelectionsChanged
+                | TerminalEvent::NewNavigationTarget(_)
+                | TerminalEvent::Open(_) => {}
             },
         );
 
@@ -2745,17 +2746,9 @@ impl AgentPanel {
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
-        if status == AgentThreadStatus::WaitingForConfirmation {
-            terminal.attention_pending = true;
-        }
-        if terminal.attention_pending && status == AgentThreadStatus::Running {
-            return;
-        }
-        if status != AgentThreadStatus::WaitingForConfirmation {
-            terminal.attention_pending = false;
-        }
-        let completed_notification_changed = status == AgentThreadStatus::Completed
-            && !terminal.completed_notification_pending;
+        terminal.attention_pending = status == AgentThreadStatus::WaitingForConfirmation;
+        let completed_notification_changed =
+            status == AgentThreadStatus::Completed && !terminal.completed_notification_pending;
         terminal.completed_notification_pending = status == AgentThreadStatus::Completed;
         let previous_status = terminal.status;
         if previous_status == status && !completed_notification_changed {
@@ -2794,7 +2787,7 @@ impl AgentPanel {
         terminal.last_input_generation = input_generation;
         if terminal.attention_pending {
             terminal.attention_pending = false;
-            terminal.status = AgentThreadStatus::Completed;
+            terminal.status = AgentThreadStatus::Running;
             terminal.has_notification = false;
             self.dismiss_terminal_notifications(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
@@ -7806,32 +7799,40 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             status(&panel, &cx),
-            AgentThreadStatus::WaitingForConfirmation,
-            "a repeated loading sequence must not hide a pending question"
+            AgentThreadStatus::Running,
+            "an explicit loading sequence must resume the running state"
         );
 
         terminal.update(&mut cx, |terminal, cx| {
-            terminal.input(b"y\r".to_vec(), cx);
+            terminal.write_output(b"\x1b]9;Permission required: approve tool use\x07", cx);
+            terminal.input(b"y".to_vec(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation,
+            "typing without submitting must keep the pending question visible"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.input(b"\r".to_vec(), cx);
             terminal.write_output(b"processing\r\n", cx);
         });
         cx.run_until_parked();
         assert_eq!(
             status(&panel, &cx),
-            AgentThreadStatus::Completed,
-            "terminal input must not invent a loading state"
+            AgentThreadStatus::Running,
+            "submitting a response must resume the loading state"
         );
-
-        terminal.update(&mut cx, |terminal, cx| {
-            terminal.write_output(b"\x1b]9;4;3\x07", cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
 
         terminal.update(&mut cx, |terminal, cx| {
             terminal.write_output(b"\x1b]9;4;4;50\x07", cx);
         });
         cx.run_until_parked();
-        assert_eq!(status(&panel, &cx), AgentThreadStatus::WaitingForConfirmation);
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation
+        );
 
         terminal.update(&mut cx, |terminal, cx| {
             terminal.write_output(b"\x1b]9;4;3\x07", cx);
@@ -7839,8 +7840,17 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             status(&panel, &cx),
-            AgentThreadStatus::WaitingForConfirmation,
-            "a paused progress state must remain latched across repeated loading"
+            AgentThreadStatus::Running,
+            "loading progress must resume from a paused state"
+        );
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;4;50\x07", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            status(&panel, &cx),
+            AgentThreadStatus::WaitingForConfirmation
         );
 
         terminal.update(&mut cx, |terminal, cx| {
@@ -7850,15 +7860,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             status(&panel, &cx),
-            AgentThreadStatus::Completed,
-            "terminal input must not invent a loading state"
+            AgentThreadStatus::Running,
+            "submitting a response to paused progress must resume loading"
         );
-
-        terminal.update(&mut cx, |terminal, cx| {
-            terminal.write_output(b"\x1b]9;4;3\x07", cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(status(&panel, &cx), AgentThreadStatus::Running);
 
         terminal.update(&mut cx, |terminal, cx| {
             terminal.write_output(b"\x1b]9;4;2;100\x07", cx);
@@ -7901,6 +7905,11 @@ mod tests {
         assert!(completion_pending(&panel, &cx));
         terminal.update(&mut cx, |terminal, cx| {
             terminal.paste("pasted request", cx);
+        });
+        cx.run_until_parked();
+        assert!(completion_pending(&panel, &cx));
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.paste("\n", cx);
         });
         cx.run_until_parked();
         assert!(!completion_pending(&panel, &cx));

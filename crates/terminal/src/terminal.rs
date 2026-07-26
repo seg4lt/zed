@@ -658,7 +658,7 @@ pub enum Event {
     BreadcrumbsChanged,
     ProgressChanged,
     Notification(String),
-    Input,
+    Input { submitted: bool },
     CloseTerminal,
     Bell,
     Wakeup,
@@ -2022,11 +2022,13 @@ impl Terminal {
     }
 
     pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>, cx: &mut Context<Self>) {
+        let input = input.into();
+        let submitted = input.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
         self.keyboard_input_sent = true;
         self.input_generation = self.input_generation.wrapping_add(1);
         self.complete_init_command_startup_handshake();
         self.write_input(input);
-        cx.emit(Event::Input);
+        cx.emit(Event::Input { submitted });
     }
 
     /// Sends a shell-level marker command and returns a task that completes when
