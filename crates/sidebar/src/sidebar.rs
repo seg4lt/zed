@@ -893,6 +893,22 @@ fn apply_worktree_label_mode(
     worktrees
 }
 
+fn worktree_ref_name(
+    branch_name: Option<&str>,
+    commit_sha: Option<&str>,
+) -> Option<SharedString> {
+    if let Some(branch_name) = branch_name {
+        return Some(SharedString::from(branch_name));
+    }
+    let commit_sha = commit_sha?;
+    Some(SharedString::from(
+        commit_sha
+            .chars()
+            .take(git::SHORT_SHA_LENGTH)
+            .collect::<String>(),
+    ))
+}
+
 /// Shows a [`RemoteConnectionModal`] on the given workspace and establishes
 /// an SSH connection. Suitable for passing to
 /// [`MultiWorkspace::find_or_create_workspace`] as the `connect_remote`
@@ -1659,24 +1675,27 @@ impl Sidebar {
         let path_detail_map: HashMap<PathBuf, usize> =
             all_paths.into_iter().zip(path_details).collect();
 
-        let mut branch_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
+        let mut worktree_ref_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
         for ws in &workspaces {
             let project = ws.read(cx).project().read(cx);
             for repo in project.repositories(cx).values() {
                 let snapshot = repo.read(cx).snapshot();
-                if let Some(branch) = &snapshot.branch {
-                    branch_by_path.insert(
-                        snapshot.work_directory_abs_path.to_path_buf(),
-                        SharedString::from(Arc::<str>::from(branch.name())),
-                    );
+                let worktree_ref = worktree_ref_name(
+                    snapshot.branch.as_ref().map(|branch| branch.name()),
+                    snapshot
+                        .head_commit
+                        .as_ref()
+                        .map(|commit| commit.sha.as_ref()),
+                );
+                if let Some(worktree_ref) = worktree_ref {
+                    worktree_ref_by_path
+                        .insert(snapshot.work_directory_abs_path.to_path_buf(), worktree_ref);
                 }
                 for linked_wt in snapshot.linked_worktrees() {
-                    if let Some(branch) = linked_wt.branch_name() {
-                        branch_by_path.insert(
-                            linked_wt.path.clone(),
-                            SharedString::from(Arc::<str>::from(branch)),
-                        );
-                    }
+                    worktree_ref_by_path.insert(
+                        linked_wt.path.clone(),
+                        SharedString::from(linked_wt.display_name().to_string()),
+                    );
                 }
             }
         }
@@ -1702,8 +1721,10 @@ impl Sidebar {
                 linked_worktree_path_lists_for_workspaces(group_workspaces, cx);
             let make_terminal_entry =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
-                    let worktrees =
-                        worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
+                    let worktrees = worktree_info_from_thread_paths(
+                        &metadata.worktree_paths,
+                        &worktree_ref_by_path,
+                    );
                     let (has_notification, status, completed_notification_pending) = live_terminal_states
                         .get(&metadata.terminal_id)
                         .copied()
@@ -1812,8 +1833,10 @@ impl Sidebar {
                 let make_thread_entry =
                     |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
                         let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
-                        let worktrees =
-                            worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
+                        let worktrees = worktree_info_from_thread_paths(
+                            &row.worktree_paths,
+                            &worktree_ref_by_path,
+                        );
                         // Start drafts as `WithContent`; the post-processing
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.

@@ -2928,7 +2928,7 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                 ),
             )
             .child(section_label(
-                "Linked worktree without branch (detached HEAD)",
+                "Linked worktree with detached HEAD (worktree / commit)",
             ))
             .child(
                 container().child(
@@ -2940,18 +2940,20 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                             full_path: "/worktrees/focal-arrow/zed".into(),
                             highlight_positions: Vec::new(),
                             kind: WorktreeKind::Linked,
-                            branch_name: None,
+                            branch_name: Some("def4567".into()),
                         }]),
                 ),
             )
-            .child(section_label("Main worktree with branch (nothing shown)"))
+            .child(section_label(
+                "Main worktree with branch (worktree / branch)",
+            ))
             .child(
                 container().child(
                     ThreadItem::new("ti-main-branch", "Request for Long Classic Poem")
                         .icon(IconName::ZedAgent)
                         .timestamp("2d")
                         .worktrees(vec![ThreadItemWorktreeInfo {
-                            worktree_name: Some("zed".into()),
+                            worktree_name: Some("main".into()),
                             full_path: "/projects/zed".into(),
                             highlight_positions: Vec::new(),
                             kind: WorktreeKind::Main,
@@ -2960,7 +2962,7 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                 ),
             )
             .child(section_label(
-                "Main worktree without branch (nothing shown)",
+                "Main worktree with detached HEAD (worktree / commit)",
             ))
             .child(
                 container().child(
@@ -2968,11 +2970,11 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                         .icon(IconName::ZedAgent)
                         .timestamp("3d")
                         .worktrees(vec![ThreadItemWorktreeInfo {
-                            worktree_name: Some("zed".into()),
+                            worktree_name: Some("main".into()),
                             full_path: "/projects/zed".into(),
                             highlight_positions: Vec::new(),
                             kind: WorktreeKind::Main,
-                            branch_name: None,
+                            branch_name: Some("abc1234".into()),
                         }]),
                 ),
             )
@@ -3047,7 +3049,7 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                 ),
             )
             .child(section_label(
-                "Main worktree with branch + diff stats + timestamp (branch hidden)",
+                "Main worktree with branch + diff stats + timestamp",
             ))
             .child(
                 container().child(
@@ -3057,7 +3059,7 @@ impl gpui::Render for ThreadItemBranchNameTestView {
                         .added(23)
                         .removed(8)
                         .worktrees(vec![ThreadItemWorktreeInfo {
-                            worktree_name: Some("zed".into()),
+                            worktree_name: Some("main".into()),
                             full_path: "/projects/zed".into(),
                             highlight_positions: Vec::new(),
                             kind: WorktreeKind::Main,

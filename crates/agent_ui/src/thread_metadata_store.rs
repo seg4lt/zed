@@ -398,11 +398,8 @@ pub fn worktree_info_from_thread_paths<S: std::hash::BuildHasher>(
                 branch_name: branch_names.get(folder_path).cloned(),
             });
         } else {
-            let Some(name) = folder_path.file_name() else {
-                continue;
-            };
             infos.push(ThreadItemWorktreeInfo {
-                worktree_name: Some(SharedString::from(name.to_string_lossy().to_string())),
+                worktree_name: Some(SharedString::from("main")),
                 full_path: SharedString::from(folder_path.display().to_string()),
                 highlight_positions: Vec::new(),
                 kind: WorktreeKind::Main,

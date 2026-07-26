@@ -425,14 +425,13 @@ impl RenderOnce for ThreadItem {
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
         );
 
-        let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
+        let worktrees: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
             .into_iter()
-            .filter(|wt| wt.kind == WorktreeKind::Linked)
             .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
             .collect();
 
-        let has_worktree = !linked_worktrees.is_empty();
+        let has_worktree = !worktrees.is_empty();
 
         let has_metadata = has_project_name
             || has_project_paths
@@ -534,7 +533,7 @@ impl RenderOnce for ThreadItem {
                                     this.child(dot_separator())
                                 })
                                 .children(
-                                    linked_worktrees.into_iter().map(|wt| {
+                                    worktrees.into_iter().map(|wt| {
                                         let worktree_label = wt.worktree_name.clone().map(|name| {
                                             if wt.highlight_positions.is_empty() {
                                                 Label::new(name)
@@ -803,13 +802,13 @@ impl Component for ThreadItem {
                     .into_any_element(),
             ),
             single_example(
-                "Main Worktree (hidden) + Changes + Timestamp",
+                "Main Worktree + Branch + Changes + Timestamp",
                 container()
                     .child(
                         ThreadItem::new("ti-5e", "Main worktree branch with diff stats")
                             .icon(IconName::ZedAgent)
                             .worktrees(vec![ThreadItemWorktreeInfo {
-                                worktree_name: Some("zed".into()),
+                                worktree_name: Some("main".into()),
                                 full_path: "/projects/zed".into(),
                                 highlight_positions: Vec::new(),
                                 kind: WorktreeKind::Main,

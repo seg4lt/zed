@@ -14234,7 +14234,7 @@ fn test_worktree_info_branch_names_for_main_worktrees() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].kind, ui::WorktreeKind::Main);
     assert_eq!(infos[0].branch_name, Some(SharedString::from("feature-x")));
-    assert_eq!(infos[0].worktree_name, Some(SharedString::from("myapp")));
+    assert_eq!(infos[0].worktree_name, Some(SharedString::from("main")));
 }
 
 #[test]
@@ -14271,7 +14271,20 @@ fn test_worktree_info_missing_branch_returns_none() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].kind, ui::WorktreeKind::Main);
     assert_eq!(infos[0].branch_name, None);
-    assert_eq!(infos[0].worktree_name, Some(SharedString::from("myapp")));
+    assert_eq!(infos[0].worktree_name, Some(SharedString::from("main")));
+}
+
+#[test]
+fn test_worktree_ref_name_prefers_branch_and_falls_back_to_short_commit() {
+    assert_eq!(
+        worktree_ref_name(Some("feature-x"), Some("1234567890")),
+        Some(SharedString::from("feature-x"))
+    );
+    assert_eq!(
+        worktree_ref_name(None, Some("1234567890")),
+        Some(SharedString::from("1234567"))
+    );
+    assert_eq!(worktree_ref_name(None, None), None);
 }
 
 #[gpui::test]
