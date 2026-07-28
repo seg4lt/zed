@@ -282,6 +282,7 @@ pub struct NumberField<T: NumberFieldType = usize> {
     apply_on_focus_lost: bool,
     tab_index: Option<isize>,
     aria_label: Option<SharedString>,
+    aria_description: Option<SharedString>,
 }
 
 impl<T: NumberFieldType> NumberField<T> {
@@ -324,6 +325,7 @@ impl<T: NumberFieldType> NumberField<T> {
             apply_on_focus_lost: false,
             tab_index: None,
             aria_label: None,
+            aria_description: None,
         }
     }
 
@@ -375,6 +377,13 @@ impl<T: NumberFieldType> NumberField<T> {
     /// Sets the label announced by assistive technology.
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
+        self
+    }
+
+    /// Sets the supplementary description announced by assistive technology
+    /// after the field's name, role, and value.
+    pub fn aria_description(mut self, description: impl Into<SharedString>) -> Self {
+        self.aria_description = Some(description.into());
         self
     }
 
@@ -554,6 +563,9 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
             .role(Role::SpinButton)
             .when_some(self.aria_label.clone(), |this, label| {
                 this.aria_label(label)
+            })
+            .when_some(self.aria_description.clone(), |this, description| {
+                this.aria_description(description)
             })
             .when_some(a11y_numeric_value(&self.value), |this, value| {
                 this.aria_numeric_value(value)
@@ -828,6 +840,10 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                                         .when_some(self.aria_label.clone(), |this, label| {
                                             this.aria_label(label)
                                         })
+                                        .when_some(
+                                            self.aria_description.clone(),
+                                            |this, description| this.aria_description(description),
+                                        )
                                         .flex_1()
                                         .h_full()
                                         .track_focus(&focus_handle)
