@@ -309,6 +309,7 @@ pub enum NewWorktreeBranchTarget {
         remote_name: Option<String>,
         remote_branch_name: Option<String>,
     },
+    NewBranchFromRef { name: String, base_ref: String },
 }
 
 /// Creates a new git worktree and switches the workspace to it.

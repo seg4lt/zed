@@ -36,6 +36,7 @@ use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
 use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation};
+use zed_actions::{CreateWorktree, NewWorktreeBranchTarget};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -722,6 +723,154 @@ struct CliWorktree {
     path: String,
 }
 
+#[derive(Clone)]
+struct CliRepositoryMetadata {
+    main_worktree_path: Option<String>,
+    branch: Option<String>,
+    default_branch: Option<String>,
+    default_branch_error: Option<String>,
+    is_main_worktree: bool,
+}
+
+fn visible_cli_worktree(
+    worktree: &gpui::Entity<project::Worktree>,
+    cx: &App,
+) -> Option<CliWorktree> {
+    let worktree = worktree.read(cx);
+    worktree.is_visible().then(|| CliWorktree {
+        id: worktree_cli_id(worktree.id()),
+        name: worktree.root_name_str().to_string(),
+        path: worktree.abs_path().to_string_lossy().into_owned(),
+    })
+}
+
+fn cli_workspace_name(workspace: &gpui::Entity<workspace::Workspace>, cx: &App) -> Option<String> {
+    let workspace = workspace.read(cx);
+    let worktree_paths = workspace.project().read(cx).worktree_paths(cx);
+    let mut names = worktree_paths
+        .ordered_pairs()
+        .filter_map(|(main_path, folder_path)| {
+            if main_path == folder_path {
+                Some("main".to_string())
+            } else {
+                project::linked_worktree_short_name(main_path, folder_path)
+                    .map(|name| name.to_string())
+            }
+        });
+    let first = names.next()?;
+    names.all(|name| name == first).then_some(first)
+}
+
+fn all_cli_project_groups(
+    cx: &App,
+) -> Vec<(
+    workspace::ProjectGroupKey,
+    Vec<(gpui::Entity<workspace::Workspace>, bool)>,
+)> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .flat_map(|window| {
+            window
+                .read(cx)
+                .map(|multi_workspace| {
+                    let active_workspace = multi_workspace.workspace();
+                    let mut groups: Vec<(
+                        workspace::ProjectGroupKey,
+                        Vec<(gpui::Entity<workspace::Workspace>, bool)>,
+                    )> = Vec::new();
+                    for workspace in multi_workspace.workspaces() {
+                        let key = multi_workspace.project_group_key_for_workspace(workspace, cx);
+                        let active = workspace == active_workspace;
+                        if let Some((_, workspaces)) =
+                            groups.iter_mut().find(|(group_key, _)| *group_key == key)
+                        {
+                            workspaces.push((workspace.clone(), active));
+                        } else {
+                            groups.push((key, vec![(workspace.clone(), active)]));
+                        }
+                    }
+                    groups
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+async fn cli_repository_metadata(
+    workspaces: &[gpui::Entity<workspace::Workspace>],
+    cx: &mut AsyncApp,
+) -> Result<std::collections::HashMap<(String, String), CliRepositoryMetadata>> {
+    let requests = cx.update(|cx| {
+        let mut requests = Vec::new();
+        for workspace in workspaces {
+            let workspace_id = workspace_cli_id(workspace);
+            let repositories = workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .repositories(cx)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for repository in repositories {
+                let snapshot = repository.read(cx).snapshot();
+                let path = snapshot
+                    .work_directory_abs_path
+                    .to_string_lossy()
+                    .into_owned();
+                let metadata = CliRepositoryMetadata {
+                    main_worktree_path: snapshot
+                        .main_worktree_abs_path()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    branch: snapshot
+                        .branch
+                        .as_ref()
+                        .map(|branch| branch.name().to_string()),
+                    default_branch: None,
+                    default_branch_error: None,
+                    is_main_worktree: snapshot.is_main_worktree(),
+                };
+                let receiver =
+                    repository.update(cx, |repository, _cx| repository.default_branch(false));
+                requests.push(((workspace_id.clone(), path), metadata, receiver));
+            }
+        }
+        requests
+    });
+
+    let metadata = future::join_all(requests.into_iter().map(
+        |(key, mut metadata, receiver)| async move {
+            match receiver.await {
+                Ok(Ok(default_branch)) => {
+                    metadata.default_branch = default_branch.map(|branch| branch.to_string());
+                }
+                Ok(Err(error)) => metadata.default_branch_error = Some(format!("{error:#}")),
+                Err(error) => metadata.default_branch_error = Some(error.to_string()),
+            }
+            (key, metadata)
+        },
+    ))
+    .await;
+    Ok(metadata.into_iter().collect())
+}
+
+fn cli_repository_for_worktree<'a>(
+    repositories: &'a std::collections::HashMap<(String, String), CliRepositoryMetadata>,
+    workspace_id: &str,
+    worktree_path: &Path,
+) -> Option<&'a CliRepositoryMetadata> {
+    repositories
+        .iter()
+        .filter_map(|((repository_workspace_id, repository_path), metadata)| {
+            let repository_path = Path::new(repository_path);
+            (repository_workspace_id == workspace_id && worktree_path.starts_with(repository_path))
+                .then_some((metadata, repository_path.components().count()))
+        })
+        .max_by_key(|(_, depth)| *depth)
+        .map(|(metadata, _)| metadata)
+}
+
 fn terminal_worktree(
     workspace: &gpui::Entity<workspace::Workspace>,
     terminal: &terminal::Terminal,
@@ -865,6 +1014,30 @@ fn all_cli_workspaces(
         .collect()
 }
 
+async fn ensure_agent_panel_in_workspace(
+    window: WindowHandle<MultiWorkspace>,
+    workspace: &gpui::Entity<workspace::Workspace>,
+    cx: &mut AsyncApp,
+) -> Result<gpui::Entity<AgentPanel>> {
+    if let Some(panel) = cx.update(|cx| workspace.read(cx).panel::<AgentPanel>(cx)) {
+        return Ok(panel);
+    }
+
+    let async_window_context =
+        window.update(cx, |_multi_workspace, window, cx| window.to_async(cx))?;
+    let loaded_panel = AgentPanel::load(workspace.downgrade(), async_window_context).await?;
+    window.update(cx, |_multi_workspace, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel
+            } else {
+                workspace.add_panel(loaded_panel.clone(), window, cx);
+                loaded_panel
+            }
+        })
+    })
+}
+
 fn find_cli_terminal(
     terminal_id: &str,
     cx: &App,
@@ -881,38 +1054,188 @@ fn find_cli_terminal(
 
 async fn handle_terminal_cli_request(request: CliRequest, cx: &mut AsyncApp) -> Result<String> {
     match request {
-        CliRequest::ListWorkspaces => cx.update(|cx| {
-            let workspaces = all_cli_workspaces(cx)
-                .into_iter()
-                .map(|(_, workspace, active)| {
-                    let workspace_ref = workspace.read(cx);
-                    let project = workspace_ref.project().read(cx);
-                    let worktrees = project
-                        .visible_worktrees(cx)
-                        .map(|worktree| {
-                            let worktree = worktree.read(cx);
-                            serde_json::json!({
-                                "id": worktree_cli_id(worktree.id()),
-                                "name": worktree.root_name_str(),
-                                "path": worktree.abs_path().to_string_lossy(),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let roots = worktrees
-                        .iter()
-                        .filter_map(|worktree| worktree["path"].as_str().map(ToOwned::to_owned))
-                        .collect::<Vec<_>>();
-                    serde_json::json!({
-                        "id": workspace_cli_id(&workspace),
-                        "active": active,
-                        "remote": project.is_remote(),
-                        "roots": roots,
-                        "worktrees": worktrees,
-                    })
-                })
+        CliRequest::ListWorkspaces => {
+            let groups = cx.update(|cx| all_cli_project_groups(cx));
+            let workspaces = groups
+                .iter()
+                .flat_map(|(_, workspaces)| workspaces.iter().map(|(workspace, _)| workspace.clone()))
                 .collect::<Vec<_>>();
-            serde_json::to_string_pretty(&workspaces).map_err(Into::into)
-        }),
+            let repository_metadata = cli_repository_metadata(&workspaces, cx).await?;
+
+            cx.update(|cx| {
+                let mut main_worktree_paths: Vec<PathBuf> = groups
+                    .iter()
+                    .flat_map(|(key, _)| key.path_list().paths().iter().cloned())
+                    .collect::<Vec<_>>();
+                main_worktree_paths.sort_unstable();
+                main_worktree_paths.dedup();
+                let path_details = util::disambiguate::compute_disambiguation_details(
+                    &main_worktree_paths,
+                    |path, detail| project::path_suffix(path, detail),
+                );
+                let path_detail_map = main_worktree_paths
+                    .into_iter()
+                    .zip(path_details)
+                    .collect::<std::collections::HashMap<_, _>>();
+
+                let projects = groups
+                    .into_iter()
+                    .map(|(key, workspaces)| {
+                        let project_name = key.display_name(&path_detail_map);
+                        let main_worktree_paths = key
+                            .path_list()
+                            .ordered_paths()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>();
+                        let active = workspaces.iter().any(|(_, active)| *active);
+                        let remote = key.host().is_some();
+                        let workspaces = workspaces
+                            .into_iter()
+                            .map(|(workspace, active)| {
+                                let workspace_id = workspace_cli_id(&workspace);
+                                let workspace_ref = workspace.read(cx);
+                                let project = workspace_ref.project().read(cx);
+                                let worktree_paths = project.worktree_paths(cx);
+                                let worktrees = project
+                                    .visible_worktrees(cx)
+                                    .map(|worktree| {
+                                        let worktree = worktree.read(cx);
+                                        let worktree_path = worktree.abs_path();
+                                        let hierarchy = worktree_paths
+                                            .ordered_pairs()
+                                            .find(|(_, folder_path)| {
+                                                folder_path.as_path() == worktree_path.as_ref()
+                                            });
+                                        let hierarchy_main_worktree_path = hierarchy.map(
+                                            |(main_path, _)| {
+                                                main_path.to_string_lossy().into_owned()
+                                            },
+                                        );
+                                        let hierarchy_is_main_worktree = hierarchy.map(
+                                            |(main_path, folder_path)| main_path == folder_path,
+                                        );
+                                        let repository = cli_repository_for_worktree(
+                                            &repository_metadata,
+                                            &workspace_id,
+                                            worktree_path.as_ref(),
+                                        );
+                                        let path = worktree_path.to_string_lossy().into_owned();
+                                        serde_json::json!({
+                                            "id": worktree_cli_id(worktree.id()),
+                                            "name": worktree.root_name_str(),
+                                            "path": path,
+                                            "branch": repository.and_then(|repository| repository.branch.as_ref()),
+                                            "default_branch": repository.and_then(|repository| repository.default_branch.as_ref()),
+                                            "default_branch_error": repository.and_then(|repository| repository.default_branch_error.as_ref()),
+                                            "is_main_worktree": repository.map(|repository| repository.is_main_worktree).or(hierarchy_is_main_worktree),
+                                            "main_worktree_path": repository.and_then(|repository| repository.main_worktree_path.as_ref()).or(hierarchy_main_worktree_path.as_ref()),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                let roots = worktrees
+                                    .iter()
+                                    .filter_map(|worktree| {
+                                        worktree["path"].as_str().map(ToOwned::to_owned)
+                                    })
+                                    .collect::<Vec<_>>();
+                                serde_json::json!({
+                                    "id": workspace_id,
+                                    "name": cli_workspace_name(&workspace, cx),
+                                    "active": active,
+                                    "remote": project.is_remote(),
+                                    "roots": roots,
+                                    "worktrees": worktrees,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({
+                            "name": project_name,
+                            "active": active,
+                            "remote": remote,
+                            "main_worktree_paths": main_worktree_paths,
+                            "workspaces": workspaces,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::to_string_pretty(&projects).map_err(Into::into)
+            })
+        }
+        CliRequest::CreateWorktree {
+            workspace_id,
+            base_ref,
+            branch,
+            worktree_name,
+        } => {
+            let (window, creation_task) = cx.update(|cx| -> Result<_> {
+                let (window, workspace, _) = all_cli_workspaces(cx)
+                    .into_iter()
+                    .find(|(_, workspace, _)| workspace_cli_id(workspace) == workspace_id)
+                    .ok_or_else(|| anyhow!("workspace {workspace_id:?} is not open"))?;
+                let branch_target = match (base_ref.clone(), branch.clone()) {
+                    (Some(base_ref), Some(name)) => {
+                        NewWorktreeBranchTarget::NewBranchFromRef { name, base_ref }
+                    }
+                    (None, Some(name)) => NewWorktreeBranchTarget::NewBranch {
+                        name,
+                        remote_name: None,
+                        remote_branch_name: None,
+                    },
+                    (Some(name), None) => NewWorktreeBranchTarget::ExistingBranch { name },
+                    (None, None) => NewWorktreeBranchTarget::CurrentBranch,
+                };
+                let action = CreateWorktree {
+                    worktree_name,
+                    branch_target,
+                };
+                let creation_task = window.update(cx, |_multi_workspace, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        git_ui::worktree_service::create_worktree_workspace(
+                            workspace, &action, window, None, cx,
+                        )
+                    })
+                })?;
+                Ok((window, creation_task))
+            })?;
+
+            let created = creation_task
+                .await
+                .context("failed to create worktree workspace")?;
+            ensure_agent_panel_in_workspace(window, &created.workspace, cx).await?;
+            cx.update(|cx| {
+                let project = created.workspace.read(cx).project().read(cx);
+                let mut worktrees = project
+                    .visible_worktrees(cx)
+                    .filter_map(|worktree| visible_cli_worktree(&worktree, cx))
+                    .collect::<Vec<_>>();
+                worktrees.sort_by(|left, right| left.path.cmp(&right.path));
+                anyhow::ensure!(
+                    !worktrees.is_empty(),
+                    "created workspace has no visible worktrees"
+                );
+                let only_worktree = match worktrees.as_slice() {
+                    [worktree] => Some(worktree),
+                    _ => None,
+                };
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source_workspace_id": workspace_id,
+                    "workspace_id": workspace_cli_id(&created.workspace),
+                    "workspace_name": cli_workspace_name(&created.workspace, cx),
+                    "worktree_id": only_worktree.map(|worktree| &worktree.id),
+                    "worktree_name": only_worktree.map(|worktree| &worktree.name),
+                    "worktree_path": only_worktree.map(|worktree| &worktree.path),
+                    "worktrees": worktrees.iter().map(|worktree| serde_json::json!({
+                        "id": worktree.id,
+                        "name": worktree.name,
+                        "path": worktree.path,
+                    })).collect::<Vec<_>>(),
+                    "base_ref": base_ref,
+                    "branch": branch,
+                    "detached": branch.is_none(),
+                    "consolidated_worktrees": created.consolidated_worktrees,
+                }))
+                .map_err(Into::into)
+            })
+        }
         CliRequest::ListTerminals {
             workspace_id,
             worktree_id,
@@ -1855,9 +2178,9 @@ mod tests {
             .expect("workspace list should succeed");
         let workspace_list: serde_json::Value =
             serde_json::from_str(&workspace_list).expect("workspace list should be JSON");
-        let worktrees = workspace_list[0]["worktrees"]
+        let worktrees = workspace_list[0]["workspaces"][0]["worktrees"]
             .as_array()
-            .expect("workspace should include worktrees");
+            .unwrap_or_else(|| panic!("workspace should include worktrees: {workspace_list}"));
         assert_eq!(worktrees.len(), 2);
         assert!(worktrees.iter().all(|worktree| {
             worktree["id"]
@@ -2028,6 +2351,152 @@ mod tests {
             }),
             "unexpected terminal list: {terminal_list}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_worktree_cli_creates_visible_workspace_for_terminal_spawn(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": { "main.rs": "fn main() {}" },
+                },
+            }),
+        )
+        .await;
+        let project_root = Path::new(path!("/root/project"));
+        let project = Project::test(fs, [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let source_workspace_id = window
+            .update(cx, |multi_workspace, _window, _cx| {
+                workspace_cli_id(multi_workspace.workspace())
+            })
+            .expect("workspace window should be available");
+
+        let create_result = cx
+            .spawn({
+                let source_workspace_id = source_workspace_id.clone();
+                |mut cx| async move {
+                    handle_terminal_cli_request(
+                        CliRequest::CreateWorktree {
+                            workspace_id: source_workspace_id,
+                            base_ref: Some("HEAD".to_string()),
+                            branch: Some("agent/cli-task".to_string()),
+                            worktree_name: Some("cli-task".to_string()),
+                        },
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect("worktree creation should succeed");
+        let create_result: serde_json::Value =
+            serde_json::from_str(&create_result).expect("create result should be JSON");
+        let created_workspace_id = create_result["workspace_id"]
+            .as_str()
+            .expect("create result should contain a workspace ID")
+            .to_string();
+        let created_worktree_id = create_result["worktree_id"]
+            .as_str()
+            .expect("single-repository result should contain a worktree ID")
+            .to_string();
+        assert_ne!(created_workspace_id, source_workspace_id);
+        assert_eq!(create_result["workspace_name"], "cli-task");
+        assert_eq!(create_result["worktree_name"], "project");
+        assert_eq!(create_result["base_ref"], "HEAD");
+        assert_eq!(create_result["branch"], "agent/cli-task");
+        assert_eq!(create_result["detached"], false);
+
+        let created_is_visible = cx.read(|cx| {
+            all_cli_workspaces(cx)
+                .into_iter()
+                .any(|(_, workspace, _)| workspace_cli_id(&workspace) == created_workspace_id)
+        });
+        assert!(
+            created_is_visible,
+            "created worktree workspace should be retained in the sidebar"
+        );
+
+        cx.run_until_parked();
+        let workspace_list = cx
+            .spawn(|mut cx| async move {
+                handle_terminal_cli_request(CliRequest::ListWorkspaces, &mut cx).await
+            })
+            .await
+            .expect("workspace list should succeed");
+        let workspace_list: serde_json::Value =
+            serde_json::from_str(&workspace_list).expect("workspace list should be JSON");
+        let projects = workspace_list
+            .as_array()
+            .expect("workspace list should contain projects");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "project");
+        assert_eq!(
+            projects[0]["main_worktree_paths"][0],
+            project_root.to_string_lossy().as_ref()
+        );
+        let project_workspaces = projects[0]["workspaces"]
+            .as_array()
+            .expect("project should contain workspaces");
+        assert_eq!(project_workspaces.len(), 2);
+        let main_workspace = project_workspaces
+            .iter()
+            .find(|workspace| workspace["name"] == "main")
+            .expect("project should contain its main workspace");
+        assert_eq!(main_workspace["worktrees"][0]["is_main_worktree"], true);
+        let created_workspace = project_workspaces
+            .iter()
+            .find(|workspace| workspace["id"] == create_result["workspace_id"])
+            .expect("project should contain the created workspace");
+        assert_eq!(created_workspace["name"], "cli-task");
+        assert_eq!(created_workspace["worktrees"][0]["name"], "project");
+        assert_eq!(created_workspace["worktrees"][0]["default_branch"], "main");
+        assert_eq!(created_workspace["worktrees"][0]["is_main_worktree"], false);
+        assert_eq!(
+            created_workspace["worktrees"][0]["main_worktree_path"],
+            project_root.to_string_lossy().as_ref()
+        );
+
+        let worktree_id_for_spawn = created_worktree_id.clone();
+        let spawn_result = cx
+            .spawn(move |mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::SpawnTerminal {
+                        workspace_id: created_workspace_id,
+                        worktree_id: Some(worktree_id_for_spawn),
+                        cwd: None,
+                        command: if cfg!(windows) {
+                            vec![
+                                "cmd.exe".to_string(),
+                                "/D".to_string(),
+                                "/C".to_string(),
+                                "exit".to_string(),
+                                "0".to_string(),
+                            ]
+                        } else {
+                            vec!["true".to_string()]
+                        },
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect("terminal should spawn in the created worktree");
+        let spawn_result: serde_json::Value =
+            serde_json::from_str(&spawn_result).expect("spawn result should be JSON");
+        assert_eq!(spawn_result["worktree_id"], created_worktree_id);
     }
 
     fn assert_ssh_parse(

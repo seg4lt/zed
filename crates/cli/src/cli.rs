@@ -73,6 +73,12 @@ pub enum CliRequest {
         behavior: CliBehaviorSetting,
     },
     ListWorkspaces,
+    CreateWorktree {
+        workspace_id: String,
+        base_ref: Option<String>,
+        branch: Option<String>,
+        worktree_name: Option<String>,
+    },
     ListTerminals {
         workspace_id: Option<String>,
         worktree_id: Option<String>,

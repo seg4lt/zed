@@ -372,6 +372,7 @@ pub fn resolve_worktree_branch_target(branch_target: &NewWorktreeBranchTarget) -
             .as_ref()
             .zip(remote_branch_name.as_ref())
             .map(|(remote_name, branch_name)| format!("refs/remotes/{remote_name}/{branch_name}")),
+        NewWorktreeBranchTarget::NewBranchFromRef { base_ref, .. } => Some(base_ref.clone()),
     }
 }
 
@@ -388,7 +389,8 @@ fn remote_branch_to_fetch(branch_target: &NewWorktreeBranchTarget) -> Option<(&s
         } => Some((remote_name, branch_name)),
         NewWorktreeBranchTarget::CurrentBranch
         | NewWorktreeBranchTarget::ExistingBranch { .. }
-        | NewWorktreeBranchTarget::NewBranch { .. } => None,
+        | NewWorktreeBranchTarget::NewBranch { .. }
+        | NewWorktreeBranchTarget::NewBranchFromRef { .. } => None,
     }
 }
 
@@ -1064,7 +1066,8 @@ async fn do_create_worktree(
 
     let base_ref = resolve_worktree_branch_target(&branch_target);
     let branch_name = match &branch_target {
-        NewWorktreeBranchTarget::NewBranch { name, .. } => Some(name.clone()),
+        NewWorktreeBranchTarget::NewBranch { name, .. }
+        | NewWorktreeBranchTarget::NewBranchFromRef { name, .. } => Some(name.clone()),
         _ => None,
     };
     let mut repositories_with_existing_branch = Vec::new();
@@ -1806,6 +1809,16 @@ mod tests {
         assert_eq!(resolve_worktree_branch_target(&new_branch), None);
         assert_eq!(remote_branch_to_fetch(&new_branch), None);
 
+        let new_branch_from_ref = NewWorktreeBranchTarget::NewBranchFromRef {
+            name: "agent/task".to_string(),
+            base_ref: "main".to_string(),
+        };
+        assert_eq!(
+            resolve_worktree_branch_target(&new_branch_from_ref).as_deref(),
+            Some("main")
+        );
+        assert_eq!(remote_branch_to_fetch(&new_branch_from_ref), None);
+
         assert_eq!(
             worktree_creation_target(Some("feature/foo".into()), None, true),
             git::repository::CreateWorktreeTarget::ExistingBranch {
@@ -1817,6 +1830,17 @@ mod tests {
             git::repository::CreateWorktreeTarget::NewBranch {
                 branch_name: "feature/foo".into(),
                 base_sha: None,
+            }
+        );
+        assert_eq!(
+            worktree_creation_target(
+                Some("agent/task".into()),
+                Some("main".into()),
+                false,
+            ),
+            git::repository::CreateWorktreeTarget::NewBranch {
+                branch_name: "agent/task".into(),
+                base_sha: Some("main".into()),
             }
         );
     }

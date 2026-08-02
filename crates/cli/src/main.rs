@@ -173,6 +173,8 @@ struct ControlArgs {
 enum ControlCommand {
     /// Inspect the projects open in Zed workspace sidebars.
     Workspace(WorkspaceArgs),
+    /// Create git worktrees that are visible in Zed workspace sidebars.
+    Worktree(WorktreeArgs),
     /// Inspect and control terminals in the running Zed application.
     Terminal(TerminalArgs),
 }
@@ -190,6 +192,31 @@ enum WorkspaceCommand {
 }
 
 #[derive(Debug, ClapArgs)]
+struct WorktreeArgs {
+    #[command(subcommand)]
+    command: WorktreeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    /// Create and open a git worktree in the workspace sidebar.
+    Create {
+        /// Source workspace containing the git repository.
+        #[arg(long)]
+        workspace: String,
+        /// Existing branch or ref to use as the new worktree's base.
+        #[arg(long)]
+        base: Option<String>,
+        /// Local branch to use, creating it from --base when it does not exist.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Worktree directory and display name. Zed generates one when omitted.
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, ClapArgs)]
 struct TerminalArgs {
     #[command(subcommand)]
     command: TerminalCommand,
@@ -197,7 +224,7 @@ struct TerminalArgs {
 
 #[derive(Debug, Subcommand)]
 enum TerminalCommand {
-    /// List live terminals, including terminals opened by the user.
+    /// List Agent Workspace terminals, including user-opened and restorable terminals.
     List {
         #[arg(long)]
         workspace: Option<String>,
@@ -233,6 +260,20 @@ impl ControlCommand {
             Self::Workspace(WorkspaceArgs {
                 command: WorkspaceCommand::List,
             }) => CliRequest::ListWorkspaces,
+            Self::Worktree(WorktreeArgs {
+                command:
+                    WorktreeCommand::Create {
+                        workspace,
+                        base,
+                        branch,
+                        name,
+                    },
+            }) => CliRequest::CreateWorktree {
+                workspace_id: workspace.clone(),
+                base_ref: base.clone(),
+                branch: branch.clone(),
+                worktree_name: name.clone(),
+            },
             Self::Terminal(TerminalArgs { command }) => match command {
                 TerminalCommand::List {
                     workspace,
@@ -538,6 +579,41 @@ mod tests {
                 })
             }))
         ));
+
+        let args = Args::try_parse_from([
+            "zed",
+            "ctl",
+            "worktree",
+            "create",
+            "--workspace",
+            "workspace-1",
+            "--base",
+            "main",
+            "--branch",
+            "agent/my-task",
+            "--name",
+            "my-task",
+        ])
+        .expect("worktree create command should parse");
+        let Some(RootCommand::Ctl(control)) = args.command else {
+            panic!("expected worktree control command");
+        };
+        let CliRequest::CreateWorktree {
+            workspace_id,
+            base_ref,
+            branch,
+            worktree_name,
+        } = control
+            .command
+            .request()
+            .expect("worktree create request should be valid")
+        else {
+            panic!("expected create worktree request");
+        };
+        assert_eq!(workspace_id, "workspace-1");
+        assert_eq!(base_ref.as_deref(), Some("main"));
+        assert_eq!(branch.as_deref(), Some("agent/my-task"));
+        assert_eq!(worktree_name.as_deref(), Some("my-task"));
 
         let args = Args::try_parse_from(["zed", "terminal"])
             .expect("a path named terminal should remain a path");
