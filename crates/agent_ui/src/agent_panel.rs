@@ -86,6 +86,7 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
+use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal::{Event as TerminalEvent, TerminalProgress, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
@@ -1221,6 +1222,15 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(workspace, window, cx)
+    }
+
     fn serialize(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
             return;
@@ -3511,6 +3521,91 @@ impl AgentPanel {
                 working_directory: terminal.working_directory.clone(),
             })
             .collect()
+    }
+
+    pub fn terminal_views(&self) -> Vec<(TerminalId, Entity<TerminalView>)> {
+        self.terminals
+            .iter()
+            .map(|(id, terminal)| (*id, terminal.view.clone()))
+            .collect()
+    }
+
+    pub fn spawn_terminal_for_cli(
+        &mut self,
+        working_directory: Option<PathBuf>,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(TerminalId, Entity<terminal::Terminal>)>> {
+        if !self.supports_terminal(cx) {
+            return Task::ready(Err(anyhow!("agent terminals are not supported")));
+        }
+
+        let terminal_id = TerminalId::new();
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        let terminal_task = if command.is_empty() {
+            self.project.update(cx, |project, cx| {
+                project.create_agent_terminal_shell(working_directory.clone(), cx)
+            })
+        } else {
+            let label = command.join(" ");
+            self.project.update(cx, |project, cx| {
+                project.create_terminal_task(
+                    SpawnInTerminal {
+                        id: TaskId(format!("agent-cli-{terminal_id}")),
+                        full_label: label.clone(),
+                        label: label.clone(),
+                        command: command.first().cloned(),
+                        args: command.get(1..).unwrap_or_default().to_vec(),
+                        command_label: label,
+                        cwd: working_directory.clone(),
+                        use_new_terminal: true,
+                        allow_concurrent_runs: true,
+                        reveal: RevealStrategy::Always,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        };
+        let workspace = self.workspace.clone();
+        let workspace_id = self.workspace_id;
+        let project = self.project.downgrade();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = terminal_task.await?;
+            this.update_in(cx, |this, window, cx| {
+                let terminal_view = cx.new(|cx| {
+                    let mut view = TerminalView::new(
+                        terminal.clone(),
+                        workspace.clone(),
+                        workspace_id,
+                        project,
+                        window,
+                        cx,
+                    );
+                    view.set_show_workspace_actions(false, cx);
+                    view
+                });
+                this.insert_terminal(
+                    terminal_id,
+                    terminal_view,
+                    working_directory,
+                    None,
+                    None,
+                    None,
+                    true,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            })?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx)
+            })?;
+            Ok((terminal_id, terminal))
+        })
     }
 
     pub fn editor_text(&self, id: ThreadId, cx: &App) -> Option<String> {

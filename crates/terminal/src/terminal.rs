@@ -2219,6 +2219,18 @@ impl Terminal {
         self.events.push_back(InternalEvent::ToggleViMode);
     }
 
+    pub fn exit_vi_mode(&mut self) {
+        if !self.vi_mode_enabled {
+            return;
+        }
+
+        let mut terminal = self.term.lock_unfair();
+        scroll_display(&mut terminal, Scroll::Bottom);
+        self.vi_mode_enabled = false;
+        toggle_term_vi_mode(&mut terminal);
+        self.last_content = make_content(&terminal, &self.last_content);
+    }
+
     pub fn vi_motion(&mut self, keystroke: &Keystroke) {
         if !self.vi_mode_enabled {
             return;
@@ -2377,6 +2389,17 @@ impl Terminal {
         let term = self.term.lock_unfair();
         let content = term.renderable_content();
         f(RenderableCells::new(content.display_iter))
+    }
+
+    pub fn refresh_content_snapshot(&mut self) {
+        let terminal = self.term.lock_unfair();
+        self.last_content = make_content(&terminal, &self.last_content);
+    }
+
+    pub fn get_content_snapshot(&mut self) -> String {
+        let terminal = self.term.lock_unfair();
+        self.last_content = make_content(&terminal, &self.last_content);
+        content_text(&terminal)
     }
 
     pub fn get_content(&self) -> String {

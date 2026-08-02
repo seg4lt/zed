@@ -1,0 +1,4 @@
+interface:
+  display_name: "Control Zed Terminals"
+  short_description: "Safely inspect and control Zed terminals"
+  default_prompt: "Use $control-zed-terminals to discover Agent Workspace terminals and safely read, control, spawn, or close them."

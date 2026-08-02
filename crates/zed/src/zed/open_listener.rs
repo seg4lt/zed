@@ -1,6 +1,9 @@
 use crate::handle_open_request;
 use crate::restore_or_create_workspace;
-use agent_ui::ExternalSourcePrompt;
+use agent_ui::{
+    AgentPanel, ExternalSourcePrompt, TerminalId,
+    terminal_thread_metadata_store::{TerminalThreadMetadata, TerminalThreadMetadataStore},
+};
 use anyhow::{Context as _, Result, anyhow};
 use cli::{CliRequest, CliResponse, CliResponseSink};
 use cli::{IpcHandshake, ipc};
@@ -14,7 +17,7 @@ use futures::future;
 
 use futures::{FutureExt, StreamExt};
 use git_ui::{file_diff_view::FileDiffView, multi_diff_view::MultiDiffView};
-use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
+use gpui::{App, AsyncApp, Global, Keystroke, TaskExt, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
@@ -24,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use terminal::Modes;
+use terminal_view::TerminalView;
 use ui::SharedString;
 use util::ResultExt;
 use util::debug_panic;
@@ -675,6 +680,538 @@ pub async fn handle_cli_connection(
                 // resolve_open_behavior
                 debug_panic!("unexpected SetOpenBehavior message");
             }
+            request => {
+                let result = handle_terminal_cli_request(request, cx).await;
+                match result {
+                    Ok(output) => {
+                        responses
+                            .send(CliResponse::Stdout { message: output })
+                            .log_err();
+                        responses.send(CliResponse::Exit { status: 0 }).log_err();
+                    }
+                    Err(error) => {
+                        responses
+                            .send(CliResponse::Stderr {
+                                message: format!("{error:#}"),
+                            })
+                            .log_err();
+                        responses.send(CliResponse::Exit { status: 1 }).log_err();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn workspace_cli_id(workspace: &gpui::Entity<workspace::Workspace>) -> String {
+    format!("workspace-{}", workspace.entity_id())
+}
+
+fn terminal_cli_id(terminal_id: TerminalId) -> String {
+    format!("terminal-{terminal_id}")
+}
+
+fn worktree_cli_id(id: impl std::fmt::Display) -> String {
+    format!("worktree-{id}")
+}
+
+#[derive(Clone)]
+struct CliWorktree {
+    id: String,
+    name: String,
+    path: String,
+}
+
+fn terminal_worktree(
+    workspace: &gpui::Entity<workspace::Workspace>,
+    terminal: &terminal::Terminal,
+    cx: &App,
+) -> Option<CliWorktree> {
+    let cwd = terminal.working_directory()?;
+    let project = workspace.read(cx).project().read(cx);
+    let (worktree, _) = project.find_worktree(&cwd, cx)?;
+    let worktree = worktree.read(cx);
+    worktree.is_visible().then(|| CliWorktree {
+        id: worktree_cli_id(worktree.id()),
+        name: worktree.root_name_str().to_string(),
+        path: worktree.abs_path().to_string_lossy().into_owned(),
+    })
+}
+
+fn terminal_task_status(terminal: &terminal::Terminal) -> &'static str {
+    match terminal.task().map(|task| task.status) {
+        Some(terminal::TaskStatus::Running) => "running",
+        Some(terminal::TaskStatus::Completed { success: true }) => "succeeded",
+        Some(terminal::TaskStatus::Completed { success: false }) => "failed",
+        Some(terminal::TaskStatus::Unknown) => "unknown",
+        None => "interactive",
+    }
+}
+
+fn terminal_views_in_workspace(
+    workspace: &gpui::Entity<workspace::Workspace>,
+    cx: &App,
+) -> Vec<(TerminalId, gpui::Entity<TerminalView>)> {
+    let workspace_ref = workspace.read(cx);
+    let Some(panel) = workspace_ref.panel::<AgentPanel>(cx) else {
+        return Vec::new();
+    };
+    let mut views = panel.read(cx).terminal_views();
+    views.sort_by_key(|(terminal_id, _)| terminal_id.to_string());
+    views
+}
+
+struct CliTerminalEntry {
+    workspace: gpui::Entity<workspace::Workspace>,
+    terminal_id: TerminalId,
+    view: Option<gpui::Entity<TerminalView>>,
+    metadata: Option<TerminalThreadMetadata>,
+}
+
+fn all_cli_terminals(cx: &App) -> Vec<CliTerminalEntry> {
+    let mut terminals = Vec::new();
+    let mut seen_terminal_ids = std::collections::HashSet::new();
+
+    for (_, workspace, _) in all_cli_workspaces(cx) {
+        for (terminal_id, view) in terminal_views_in_workspace(&workspace, cx) {
+            if seen_terminal_ids.insert(terminal_id) {
+                terminals.push(CliTerminalEntry {
+                    workspace: workspace.clone(),
+                    terminal_id,
+                    view: Some(view),
+                    metadata: None,
+                });
+            }
+        }
+    }
+
+    let Some(metadata_store) = TerminalThreadMetadataStore::try_global(cx) else {
+        return terminals;
+    };
+    let metadata_store = metadata_store.read(cx);
+    for window in cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+    {
+        let Ok(project_groups) =
+            window.read_with(cx, |multi_workspace, cx| multi_workspace.project_groups(cx))
+        else {
+            continue;
+        };
+        for project_group in project_groups {
+            let Some(workspace) = project_group.workspaces.first().cloned() else {
+                continue;
+            };
+            let remote_connection = project_group.key.host();
+            for metadata in metadata_store.entries_for_main_worktree_path(
+                project_group.key.path_list(),
+                remote_connection.as_ref(),
+            ) {
+                if seen_terminal_ids.insert(metadata.terminal_id) {
+                    terminals.push(CliTerminalEntry {
+                        workspace: workspace.clone(),
+                        terminal_id: metadata.terminal_id,
+                        view: None,
+                        metadata: Some(metadata.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    terminals.sort_by_key(|terminal| terminal.terminal_id.to_string());
+    terminals
+}
+
+fn metadata_worktree(metadata: &TerminalThreadMetadata) -> Option<(String, String)> {
+    let [path] = metadata.folder_paths().paths() else {
+        return None;
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    Some((name, path.to_string_lossy().into_owned()))
+}
+
+fn all_cli_workspaces(
+    cx: &App,
+) -> Vec<(
+    WindowHandle<MultiWorkspace>,
+    gpui::Entity<workspace::Workspace>,
+    bool,
+)> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .flat_map(|window| {
+            window
+                .read(cx)
+                .map(|multi_workspace| {
+                    multi_workspace
+                        .workspaces()
+                        .map(|workspace| {
+                            (
+                                window,
+                                workspace.clone(),
+                                workspace == multi_workspace.workspace(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn find_cli_terminal(
+    terminal_id: &str,
+    cx: &App,
+) -> Option<(
+    gpui::Entity<workspace::Workspace>,
+    gpui::Entity<terminal::Terminal>,
+)> {
+    all_cli_terminals(cx)
+        .into_iter()
+        .filter_map(|entry| Some((entry.workspace, entry.terminal_id, entry.view?)))
+        .find(|(_, agent_terminal_id, _)| terminal_cli_id(*agent_terminal_id) == terminal_id)
+        .map(|(workspace, _, view)| (workspace, view.read(cx).terminal().clone()))
+}
+
+async fn handle_terminal_cli_request(request: CliRequest, cx: &mut AsyncApp) -> Result<String> {
+    match request {
+        CliRequest::ListWorkspaces => cx.update(|cx| {
+            let workspaces = all_cli_workspaces(cx)
+                .into_iter()
+                .map(|(_, workspace, active)| {
+                    let workspace_ref = workspace.read(cx);
+                    let project = workspace_ref.project().read(cx);
+                    let worktrees = project
+                        .visible_worktrees(cx)
+                        .map(|worktree| {
+                            let worktree = worktree.read(cx);
+                            serde_json::json!({
+                                "id": worktree_cli_id(worktree.id()),
+                                "name": worktree.root_name_str(),
+                                "path": worktree.abs_path().to_string_lossy(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let roots = worktrees
+                        .iter()
+                        .filter_map(|worktree| worktree["path"].as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "id": workspace_cli_id(&workspace),
+                        "active": active,
+                        "remote": project.is_remote(),
+                        "roots": roots,
+                        "worktrees": worktrees,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string_pretty(&workspaces).map_err(Into::into)
+        }),
+        CliRequest::ListTerminals {
+            workspace_id,
+            worktree_id,
+        } => cx.update(|cx| {
+            let workspaces = all_cli_workspaces(cx);
+            if let Some(workspace_id) = workspace_id.as_ref() {
+                anyhow::ensure!(
+                    workspaces
+                        .iter()
+                        .any(|(_, workspace, _)| workspace_cli_id(workspace) == *workspace_id),
+                    "workspace {workspace_id:?} is not open"
+                );
+            }
+            if let Some(worktree_id) = worktree_id.as_ref() {
+                let workspace_id = workspace_id
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("--worktree requires --workspace"))?;
+                let workspace = workspaces
+                    .iter()
+                    .find(|(_, workspace, _)| workspace_cli_id(workspace) == *workspace_id)
+                    .map(|(_, workspace, _)| workspace)
+                    .ok_or_else(|| anyhow!("workspace {workspace_id:?} is not open"))?;
+                let project = workspace.read(cx).project().read(cx);
+                anyhow::ensure!(
+                    project
+                        .visible_worktrees(cx)
+                        .any(|worktree| worktree_cli_id(worktree.read(cx).id()) == *worktree_id),
+                    "worktree {worktree_id:?} is not open in workspace {workspace_id:?}"
+                );
+            }
+            let terminals = all_cli_terminals(cx)
+                .into_iter()
+                .filter(|entry| {
+                    workspace_id.as_ref().is_none_or(|id| {
+                        workspace_cli_id(&entry.workspace) == *id
+                    })
+                })
+                .filter_map(|entry| {
+                    let terminal_id = terminal_cli_id(entry.terminal_id);
+                    if let Some(view) = entry.view {
+                        let terminal = view.read(cx).terminal().clone();
+                        return terminal.update(cx, |terminal, cx| {
+                            terminal.refresh_content_snapshot();
+                            let worktree = terminal_worktree(&entry.workspace, terminal, cx);
+                            if worktree_id.as_ref().is_some_and(|worktree_id| {
+                                worktree.as_ref().is_none_or(|worktree| worktree.id != *worktree_id)
+                            }) {
+                                return None;
+                            }
+                            Some(serde_json::json!({
+                                "id": terminal_id,
+                                "workspace_id": workspace_cli_id(&entry.workspace),
+                                "location": "agent",
+                                "loaded": true,
+                                "title": terminal.title(false),
+                                "cwd": terminal.working_directory(),
+                                "pid": terminal.pid().map(|pid| pid.as_u32()),
+                                "status": terminal_task_status(terminal),
+                                "buffer": if terminal.last_content.mode.contains(Modes::ALT_SCREEN) {
+                                    "alternate"
+                                } else {
+                                    "primary"
+                                },
+                                "vi_mode": terminal.vi_mode_enabled(),
+                                "worktree_id": worktree.as_ref().map(|worktree| &worktree.id),
+                                "worktree_name": worktree.as_ref().map(|worktree| &worktree.name),
+                                "worktree_path": worktree.as_ref().map(|worktree| &worktree.path),
+                            }))
+                        });
+                    }
+
+                    let metadata = entry.metadata?;
+                    if worktree_id.is_some() {
+                        return None;
+                    }
+                    let worktree = metadata_worktree(&metadata);
+                    Some(serde_json::json!({
+                        "id": terminal_id,
+                        "workspace_id": workspace_cli_id(&entry.workspace),
+                        "location": "agent",
+                        "loaded": false,
+                        "title": metadata.display_title(),
+                        "cwd": metadata.working_directory,
+                        "pid": null,
+                        "status": "unloaded",
+                        "buffer": null,
+                        "vi_mode": false,
+                        "worktree_id": null,
+                        "worktree_name": worktree.as_ref().map(|(name, _)| name),
+                        "worktree_path": worktree.as_ref().map(|(_, path)| path),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string_pretty(&terminals).map_err(Into::into)
+        }),
+        CliRequest::ReadTerminal { terminal_id } => cx.update(|cx| {
+            let (workspace, terminal) = find_cli_terminal(&terminal_id, cx)
+                .ok_or_else(|| anyhow!("terminal {terminal_id:?} is not open"))?;
+            let snapshot = terminal.update(cx, |terminal, cx| {
+                let snapshot_content = terminal.get_content_snapshot();
+                let content = &terminal.last_content;
+                let worktree = terminal_worktree(&workspace, terminal, cx);
+                serde_json::json!({
+                    "id": terminal_id,
+                    "workspace_id": workspace_cli_id(&workspace),
+                    "title": terminal.title(false),
+                    "cwd": terminal.working_directory(),
+                    "pid": terminal.pid().map(|pid| pid.as_u32()),
+                    "status": terminal_task_status(terminal),
+                    "buffer": if content.mode.contains(Modes::ALT_SCREEN) {
+                        "alternate"
+                    } else {
+                        "primary"
+                    },
+                    "vi_mode": terminal.vi_mode_enabled(),
+                    "rows": content.terminal_bounds.num_lines(),
+                    "columns": content.terminal_bounds.num_columns(),
+                    "cursor": {
+                        "row": content.cursor.point.line,
+                        "column": content.cursor.point.column,
+                    },
+                    "content": snapshot_content,
+                    "worktree_id": worktree.as_ref().map(|worktree| &worktree.id),
+                    "worktree_name": worktree.as_ref().map(|worktree| &worktree.name),
+                    "worktree_path": worktree.as_ref().map(|worktree| &worktree.path),
+                })
+            });
+            serde_json::to_string_pretty(&snapshot).map_err(Into::into)
+        }),
+        CliRequest::WriteTerminal { terminal_id, input } => cx.update(|cx| {
+            let (_, terminal) = find_cli_terminal(&terminal_id, cx)
+                .ok_or_else(|| anyhow!("terminal {terminal_id:?} is not open"))?;
+            terminal.update(cx, |terminal, cx| -> Result<()> {
+                anyhow::ensure!(
+                    !terminal.vi_mode_enabled(),
+                    "terminal is in Zed vi mode; send the `i` key before writing"
+                );
+                terminal.input(input, cx);
+                Ok(())
+            })?;
+            serde_json::to_string(&serde_json::json!({ "id": terminal_id, "written": true }))
+                .map_err(Into::into)
+        }),
+        CliRequest::SendTerminalKey {
+            terminal_id,
+            keystroke,
+        } => cx.update(|cx| {
+            let (_, terminal) = find_cli_terminal(&terminal_id, cx)
+                .ok_or_else(|| anyhow!("terminal {terminal_id:?} is not open"))?;
+            let parsed = Keystroke::parse(&keystroke)
+                .with_context(|| format!("invalid keystroke {keystroke:?}"))?;
+            let handled = terminal.update(cx, |terminal, cx| -> Result<bool> {
+                terminal.refresh_content_snapshot();
+                if terminal.vi_mode_enabled() {
+                    anyhow::ensure!(
+                        parsed.key == "i" && !parsed.modifiers.modified(),
+                        "terminal is in Zed vi mode; send the `i` key to return to terminal input"
+                    );
+                    terminal.exit_vi_mode();
+                    return Ok(true);
+                }
+                Ok(terminal.try_keystroke(
+                    &parsed,
+                    terminal::terminal_settings::TerminalSettings::get_global(cx).option_as_meta,
+                    cx,
+                ))
+            })?;
+            anyhow::ensure!(
+                handled,
+                "keystroke {keystroke:?} is not supported by terminals"
+            );
+            serde_json::to_string(&serde_json::json!({ "id": terminal_id, "sent": keystroke }))
+                .map_err(Into::into)
+        }),
+        CliRequest::SpawnTerminal {
+            workspace_id,
+            worktree_id,
+            cwd,
+            command,
+        } => {
+            let (terminal_task, selected_worktree) = cx.update(|cx| -> Result<_> {
+                let (window, workspace, _) = all_cli_workspaces(cx)
+                    .into_iter()
+                    .find(|(_, workspace, _)| workspace_cli_id(workspace) == workspace_id)
+                    .ok_or_else(|| anyhow!("workspace {workspace_id:?} is not open"))?;
+                let project_entity = workspace.read(cx).project().clone();
+                let project = project_entity.read(cx);
+                let visible_worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
+                let selected_worktree = if let Some(worktree_id) = worktree_id.as_ref() {
+                    Some(
+                        visible_worktrees
+                            .iter()
+                            .find(|worktree| {
+                                worktree_cli_id(worktree.read(cx).id()) == *worktree_id
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "worktree {worktree_id:?} is not open in workspace {workspace_id:?}"
+                                )
+                            })?,
+                    )
+                } else if let Some(cwd) = cwd.as_ref() {
+                    if cwd.is_absolute() {
+                        project
+                            .find_worktree(cwd, cx)
+                            .map(|(worktree, _)| worktree)
+                            .filter(|worktree| worktree.read(cx).is_visible())
+                    } else {
+                        match visible_worktrees.as_slice() {
+                            [worktree] => Some(worktree.clone()),
+                            _ => None,
+                        }
+                    }
+                } else {
+                    match visible_worktrees.as_slice() {
+                        [] => None,
+                        [worktree] => Some(worktree.clone()),
+                        _ => anyhow::bail!(
+                            "workspace {workspace_id:?} has multiple worktrees; specify --worktree"
+                        ),
+                    }
+                };
+
+                let resolved_cwd = match (selected_worktree.as_ref(), cwd) {
+                    (Some(worktree), Some(cwd)) if cwd.is_relative() => {
+                        anyhow::ensure!(
+                            !cwd.components().any(|component| {
+                                matches!(component, std::path::Component::ParentDir)
+                            }),
+                            "relative cwd cannot leave the selected worktree"
+                        );
+                        Some(worktree.read(cx).abs_path().join(cwd))
+                    }
+                    (Some(worktree), Some(cwd)) => {
+                        let selected_id = worktree.read(cx).id();
+                        let cwd_worktree_id = project
+                            .find_worktree(&cwd, cx)
+                            .map(|(worktree, _)| worktree.read(cx).id());
+                        anyhow::ensure!(
+                            cwd_worktree_id == Some(selected_id),
+                            "cwd {} is not inside worktree {:?}",
+                            cwd.display(),
+                            worktree_cli_id(selected_id)
+                        );
+                        Some(cwd)
+                    }
+                    (Some(worktree), None) => Some(worktree.read(cx).abs_path().to_path_buf()),
+                    (None, Some(cwd)) if cwd.is_relative() => anyhow::bail!(
+                        "relative cwd requires --worktree when the workspace has no default worktree"
+                    ),
+                    (None, Some(cwd)) => {
+                        if !visible_worktrees.is_empty() {
+                            let cwd_worktree = project
+                                .find_worktree(&cwd, cx)
+                                .map(|(worktree, _)| worktree)
+                                .filter(|worktree| worktree.read(cx).is_visible());
+                            anyhow::ensure!(
+                                cwd_worktree.is_some(),
+                                "cwd {} is not inside an open worktree in workspace {workspace_id:?}",
+                                cwd.display()
+                            );
+                        }
+                        Some(cwd)
+                    }
+                    (None, None) => None,
+                };
+                let selected_worktree = selected_worktree.map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    CliWorktree {
+                        id: worktree_cli_id(worktree.id()),
+                        name: worktree.root_name_str().to_string(),
+                        path: worktree.abs_path().to_string_lossy().into_owned(),
+                    }
+                });
+                let panel = workspace
+                    .read(cx)
+                    .panel::<AgentPanel>(cx)
+                    .ok_or_else(|| anyhow!("agent panel is not available"))?;
+
+                let terminal_task = window.update(cx, |_multi_workspace, window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.spawn_terminal_for_cli(resolved_cwd, command, window, cx)
+                    })
+                })?;
+                Ok((terminal_task, selected_worktree))
+            })?;
+            let (terminal_id, _) = terminal_task.await?;
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": terminal_cli_id(terminal_id),
+                "workspace_id": workspace_id,
+                "worktree_id": selected_worktree.as_ref().map(|worktree| &worktree.id),
+                "worktree_name": selected_worktree.as_ref().map(|worktree| &worktree.name),
+                "worktree_path": selected_worktree.as_ref().map(|worktree| &worktree.path),
+            }))
+            .map_err(Into::into)
+        }
+        CliRequest::Open { .. } | CliRequest::SetOpenBehavior { .. } => {
+            anyhow::bail!("unexpected CLI request")
         }
     }
 }
@@ -1128,16 +1665,18 @@ mod tests {
     use crate::zed::{open_listener::open_local_workspace, tests::init_test};
     use cli::CliResponse;
     use editor::Editor;
+    use fs::FakeFs;
     use futures::poll;
     use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
     use language::LineEnding;
+    use project::{Project, WorktreePaths};
     use remote::SshConnectionOptions;
     use rope::Rope;
     use serde_json::json;
     use session::Session;
     use std::{path::Path, sync::Arc, task::Poll};
     use util::path;
-    use workspace::{AppState, MultiWorkspace};
+    use workspace::{AppState, MultiWorkspace, ProjectGroup};
 
     struct DiscardResponseSink;
 
@@ -1155,6 +1694,340 @@ mod tests {
                 .send(response)
                 .map_err(|error| anyhow::anyhow!("{error}"))
         }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_cli_discovers_existing_terminal_and_spawns_command(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project_root = std::env::current_dir().expect("test process should have a cwd");
+        fs.insert_tree(&project_root, json!({})).await;
+        let project = Project::test(fs, [project_root.as_path()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let (workspace_id, panel) = window
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let panel = workspace.update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| AgentPanel::new_for_test(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                });
+                (workspace_cli_id(&workspace), panel)
+            })
+            .expect("workspace window should be available");
+
+        let existing_terminal = window
+            .update(cx, |_multi_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.insert_test_terminal("existing agent terminal", false, window, cx)
+                })
+            })
+            .expect("workspace window should be available")
+            .expect("agent terminal should be inserted");
+
+        let terminal_list = cx
+            .spawn(|mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::ListTerminals {
+                        workspace_id: None,
+                        worktree_id: None,
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect("terminal list should succeed");
+        let terminal_list: serde_json::Value =
+            serde_json::from_str(&terminal_list).expect("terminal list should be JSON");
+        assert!(terminal_list.as_array().is_some_and(|terminals| {
+            terminals
+                .iter()
+                .any(|terminal| terminal["id"] == terminal_cli_id(existing_terminal))
+        }));
+
+        let command = if cfg!(windows) {
+            vec![
+                "cmd.exe".to_string(),
+                "/D".to_string(),
+                "/C".to_string(),
+                "exit".to_string(),
+                "0".to_string(),
+            ]
+        } else {
+            vec!["true".to_string()]
+        };
+        let spawn_result = cx
+            .spawn(move |mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::SpawnTerminal {
+                        workspace_id,
+                        worktree_id: None,
+                        cwd: None,
+                        command,
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect("command terminal should spawn");
+        let spawn_result: serde_json::Value =
+            serde_json::from_str(&spawn_result).expect("spawn result should be JSON");
+        let spawned_terminal_id = spawn_result["id"]
+            .as_str()
+            .expect("spawn result should contain a terminal ID")
+            .to_string();
+        assert!(spawned_terminal_id.starts_with("terminal-"));
+
+        let terminal_list = cx
+            .spawn(|mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::ListTerminals {
+                        workspace_id: None,
+                        worktree_id: None,
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect("terminal list should succeed after spawning");
+        let terminal_list: serde_json::Value =
+            serde_json::from_str(&terminal_list).expect("terminal list should be JSON");
+        assert!(terminal_list.as_array().is_some_and(|terminals| {
+            terminals.iter().any(|terminal| {
+                terminal["id"] == spawned_terminal_id && terminal["location"] == "agent"
+            })
+        }));
+
+        window
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert!(workspace.all_docks().iter().any(|dock| {
+                    let dock = dock.read(cx);
+                    dock.is_open()
+                        && dock.visible_panel().is_some_and(|visible_panel| {
+                            visible_panel.panel_id() == panel.entity_id()
+                        })
+                }));
+            })
+            .expect("workspace window should be available");
+    }
+
+    #[gpui::test]
+    async fn test_terminal_cli_lists_worktrees_and_rejects_ambiguous_spawn(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project-a"), json!({})).await;
+        fs.insert_tree(path!("/project-b"), json!({})).await;
+        let project = Project::test(
+            fs,
+            [
+                Path::new(path!("/project-a")),
+                Path::new(path!("/project-b")),
+            ],
+            cx,
+        )
+        .await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let workspace_id = window
+            .update(cx, |multi_workspace, _window, _cx| {
+                workspace_cli_id(multi_workspace.workspace())
+            })
+            .expect("workspace window should be available");
+
+        let workspace_list = cx
+            .spawn(|mut cx| async move {
+                handle_terminal_cli_request(CliRequest::ListWorkspaces, &mut cx).await
+            })
+            .await
+            .expect("workspace list should succeed");
+        let workspace_list: serde_json::Value =
+            serde_json::from_str(&workspace_list).expect("workspace list should be JSON");
+        let worktrees = workspace_list[0]["worktrees"]
+            .as_array()
+            .expect("workspace should include worktrees");
+        assert_eq!(worktrees.len(), 2);
+        assert!(worktrees.iter().all(|worktree| {
+            worktree["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("worktree-"))
+                && worktree["name"].is_string()
+                && worktree["path"].is_string()
+        }));
+        let worktree_id = worktrees[0]["id"]
+            .as_str()
+            .expect("worktree should have an ID")
+            .to_string();
+
+        let filtered_terminals = cx
+            .spawn({
+                let workspace_id = workspace_id.clone();
+                let worktree_id = worktree_id.clone();
+                move |mut cx| async move {
+                    handle_terminal_cli_request(
+                        CliRequest::ListTerminals {
+                            workspace_id: Some(workspace_id),
+                            worktree_id: Some(worktree_id),
+                        },
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect("terminal filtering by worktree should succeed");
+        assert_eq!(filtered_terminals, "[]");
+
+        let spawn_error = cx
+            .spawn({
+                let workspace_id = workspace_id.clone();
+                move |mut cx| async move {
+                    handle_terminal_cli_request(
+                        CliRequest::SpawnTerminal {
+                            workspace_id,
+                            worktree_id: None,
+                            cwd: None,
+                            command: Vec::new(),
+                        },
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect_err("spawn should require a worktree when multiple are open");
+        assert!(spawn_error.to_string().contains("specify --worktree"));
+
+        let cwd_error = cx
+            .spawn(move |mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::SpawnTerminal {
+                        workspace_id,
+                        worktree_id: Some(worktree_id),
+                        cwd: Some(PathBuf::from("../outside")),
+                        command: Vec::new(),
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect_err("relative cwd should not escape its worktree");
+        assert!(cwd_error.to_string().contains("cannot leave"));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_cli_lists_restorable_sidebar_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+        let (workspace_id, workspace, panel, project_group_key) = window
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let project_group_key = workspace.read(cx).project_group_key(cx);
+                multi_workspace.test_add_project_group(ProjectGroup {
+                    key: project_group_key.clone(),
+                    workspaces: vec![workspace.clone()],
+                    expanded: true,
+                });
+                multi_workspace.add(workspace.clone(), window, cx);
+                let panel = workspace.update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| AgentPanel::new_for_test(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel
+                });
+                (
+                    workspace_cli_id(&workspace),
+                    workspace,
+                    panel,
+                    project_group_key,
+                )
+            })
+            .expect("workspace window should be available");
+        let terminal_id = window
+            .update(cx, |_multi_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.insert_test_terminal("restorable terminal", false, window, cx)
+                })
+            })
+            .expect("workspace window should be available")
+            .expect("agent terminal should be inserted");
+        let mut metadata = cx.read(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .cloned()
+                .expect("terminal metadata should be persisted")
+        });
+        let paths = project_group_key.path_list().clone();
+        metadata.worktree_paths = WorktreePaths::from_folder_paths(&paths);
+        window
+            .update(cx, |_multi_workspace, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.remove_panel(&panel, window, cx);
+                });
+            })
+            .expect("workspace should remain open");
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .is_some(),
+                "terminal metadata should remain available"
+            );
+            assert_eq!(all_cli_terminals(cx).len(), 1);
+        });
+
+        let terminal_list = cx
+            .spawn(move |mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::ListTerminals {
+                        workspace_id: Some(workspace_id),
+                        worktree_id: None,
+                    },
+                    &mut cx,
+                )
+                .await
+            })
+            .await
+            .expect("terminal list should succeed");
+        let terminal_list: serde_json::Value =
+            serde_json::from_str(&terminal_list).expect("terminal list should be JSON");
+        assert!(
+            terminal_list.as_array().is_some_and(|terminals| {
+                terminals.iter().any(|terminal| {
+                    terminal["id"] == terminal_cli_id(terminal_id)
+                        && terminal["title"] == "restorable terminal"
+                        && terminal["loaded"] == false
+                        && terminal["status"] == "unloaded"
+                })
+            }),
+            "unexpected terminal list: {terminal_list}"
+        );
     }
 
     fn assert_ssh_parse(

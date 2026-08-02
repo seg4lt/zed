@@ -12,7 +12,7 @@ mod completions;
 use crate::completions::Shell;
 
 use anyhow::{Context as _, Result};
-use clap::{CommandFactory, Parser};
+use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
 use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
 use parking_lot::Mutex;
 use std::{
@@ -65,6 +65,8 @@ Examples:
     after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<RootCommand>,
     /// Wait for all of the given paths to be opened/closed before exiting.
     ///
     /// When opening a directory, waits until the created window is closed.
@@ -153,6 +155,131 @@ struct Args {
     /// by having Zed act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     askpass: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum RootCommand {
+    /// Control Zed through local IPC.
+    Ctl(ControlArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+struct ControlArgs {
+    #[command(subcommand)]
+    command: ControlCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    /// Inspect the projects open in Zed workspace sidebars.
+    Workspace(WorkspaceArgs),
+    /// Inspect and control terminals in the running Zed application.
+    Terminal(TerminalArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+struct WorkspaceArgs {
+    #[command(subcommand)]
+    command: WorkspaceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// List all projects open in workspace sidebars.
+    List,
+}
+
+#[derive(Debug, ClapArgs)]
+struct TerminalArgs {
+    #[command(subcommand)]
+    command: TerminalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TerminalCommand {
+    /// List live terminals, including terminals opened by the user.
+    List {
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, requires = "workspace")]
+        worktree: Option<String>,
+    },
+    /// Read the current emulator buffer and terminal state.
+    Read { terminal: String },
+    /// Write text exactly as provided without appending Enter.
+    Write {
+        terminal: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Send a semantic keystroke such as enter, ctrl-c, up, or pageup.
+    Key { terminal: String, keystroke: String },
+    /// Spawn a terminal, optionally running a command in it.
+    Spawn {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
+
+impl ControlCommand {
+    fn request(&self) -> Result<CliRequest> {
+        Ok(match self {
+            Self::Workspace(WorkspaceArgs {
+                command: WorkspaceCommand::List,
+            }) => CliRequest::ListWorkspaces,
+            Self::Terminal(TerminalArgs { command }) => match command {
+                TerminalCommand::List {
+                    workspace,
+                    worktree,
+                } => CliRequest::ListTerminals {
+                    workspace_id: workspace.clone(),
+                    worktree_id: worktree.clone(),
+                },
+                TerminalCommand::Read { terminal } => CliRequest::ReadTerminal {
+                    terminal_id: terminal.clone(),
+                },
+                TerminalCommand::Write { terminal, text } => CliRequest::WriteTerminal {
+                    terminal_id: terminal.clone(),
+                    input: text.as_bytes().to_vec(),
+                },
+                TerminalCommand::Key {
+                    terminal,
+                    keystroke,
+                } => CliRequest::SendTerminalKey {
+                    terminal_id: terminal.clone(),
+                    keystroke: keystroke.clone(),
+                },
+                TerminalCommand::Spawn {
+                    workspace,
+                    worktree,
+                    cwd,
+                    command,
+                } => {
+                    let cwd = if let Some(cwd) = cwd {
+                        Some(if cwd.is_absolute() || worktree.is_some() {
+                            cwd.clone()
+                        } else {
+                            env::current_dir()?.join(cwd)
+                        })
+                    } else {
+                        None
+                    };
+                    CliRequest::SpawnTerminal {
+                        workspace_id: workspace.clone(),
+                        worktree_id: worktree.clone(),
+                        cwd,
+                        command: command.clone(),
+                    }
+                }
+            },
+        })
+    }
 }
 
 /// Parses a path containing a position (e.g. `path:line:column`)
@@ -329,6 +456,105 @@ mod tests {
     }
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_terminal_control_commands() {
+        let args = Args::try_parse_from([
+            "zed",
+            "ctl",
+            "terminal",
+            "spawn",
+            "--workspace",
+            "workspace-1",
+            "--worktree",
+            "worktree-2",
+            "--cwd",
+            "/project",
+            "--",
+            "cargo",
+            "test",
+            "--workspace",
+        ])
+        .expect("terminal spawn command should parse");
+
+        let Some(RootCommand::Ctl(ControlArgs {
+            command:
+                ControlCommand::Terminal(TerminalArgs {
+                    command:
+                        TerminalCommand::Spawn {
+                            workspace,
+                            worktree,
+                            cwd,
+                            command,
+                        },
+                }),
+        })) = args.command
+        else {
+            panic!("expected terminal spawn command");
+        };
+        assert_eq!(workspace, "workspace-1");
+        assert_eq!(worktree.as_deref(), Some("worktree-2"));
+        assert_eq!(cwd.as_deref(), Some(Path::new("/project")));
+        assert_eq!(command, ["cargo", "test", "--workspace"]);
+
+        let args = Args::try_parse_from([
+            "zed",
+            "ctl",
+            "terminal",
+            "spawn",
+            "--workspace",
+            "workspace-1",
+            "--worktree",
+            "worktree-2",
+            "--cwd",
+            "crates/app",
+        ])
+        .expect("worktree-relative terminal cwd should parse");
+        let Some(RootCommand::Ctl(control)) = args.command else {
+            panic!("expected terminal control command");
+        };
+        let CliRequest::SpawnTerminal {
+            worktree_id, cwd, ..
+        } = control
+            .command
+            .request()
+            .expect("terminal control request should be valid")
+        else {
+            panic!("expected terminal spawn request");
+        };
+        assert_eq!(worktree_id.as_deref(), Some("worktree-2"));
+        assert_eq!(cwd.as_deref(), Some(Path::new("crates/app")));
+
+        Args::try_parse_from(["zed", "ctl", "terminal", "list", "--worktree", "worktree-2"])
+            .expect_err("worktree filtering should require a workspace");
+
+        let args = Args::try_parse_from(["zed", "ctl", "workspace", "list"])
+            .expect("workspace list command should parse");
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Ctl(ControlArgs {
+                command: ControlCommand::Workspace(WorkspaceArgs {
+                    command: WorkspaceCommand::List
+                })
+            }))
+        ));
+
+        let args = Args::try_parse_from(["zed", "terminal"])
+            .expect("a path named terminal should remain a path");
+        assert!(args.command.is_none());
+        assert_eq!(args.paths_with_position, ["terminal"]);
+
+        let args = Args::try_parse_from(["zed", "ctl", "terminal", "write", "terminal-1", "-n"])
+            .expect("terminal input starting with a hyphen should parse");
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Ctl(ControlArgs {
+                command: ControlCommand::Terminal(TerminalArgs {
+                    command: TerminalCommand::Write { text, .. }
+                })
+            })) if text == "-n"
+        ));
+    }
 
     fn with_cwd<T>(path: &Path, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         let _lock = CWD_LOCK.lock();
@@ -511,6 +737,13 @@ fn run() -> Result<()> {
     }
 
     let args = Args::parse();
+    let control_request = args
+        .command
+        .as_ref()
+        .map(|command| match command {
+            RootCommand::Ctl(control) => control.command.request(),
+        })
+        .transpose()?;
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     if let Some(socket) = &args.askpass {
@@ -717,7 +950,7 @@ fn run() -> Result<()> {
                 #[cfg(not(target_os = "windows"))]
                 let wsl = None;
 
-                let open_request = CliRequest::Open {
+                let request = control_request.unwrap_or_else(|| CliRequest::Open {
                     paths,
                     urls,
                     diff_paths,
@@ -729,9 +962,9 @@ fn run() -> Result<()> {
                     user_data_dir: user_data_dir_for_thread,
                     dev_container: args.dev_container,
                     cwd: env::current_dir().ok(),
-                };
+                });
 
-                tx.send(open_request)?;
+                tx.send(request)?;
 
                 while let Ok(response) = rx.recv() {
                     match response {

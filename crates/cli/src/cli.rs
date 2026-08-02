@@ -72,6 +72,28 @@ pub enum CliRequest {
     SetOpenBehavior {
         behavior: CliBehaviorSetting,
     },
+    ListWorkspaces,
+    ListTerminals {
+        workspace_id: Option<String>,
+        worktree_id: Option<String>,
+    },
+    ReadTerminal {
+        terminal_id: String,
+    },
+    WriteTerminal {
+        terminal_id: String,
+        input: Vec<u8>,
+    },
+    SendTerminalKey {
+        terminal_id: String,
+        keystroke: String,
+    },
+    SpawnTerminal {
+        workspace_id: String,
+        worktree_id: Option<String>,
+        cwd: Option<PathBuf>,
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
