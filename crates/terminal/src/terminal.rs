@@ -1560,7 +1560,7 @@ pub enum TerminalProgress {
     Normal(u8),
     Error(Option<u8>),
     Indeterminate,
-    Warning(u8),
+    Warning(Option<u8>),
 }
 
 impl TaskStatus {

@@ -744,7 +744,7 @@ pub enum Progress {
     Set(u8),
     Error(Option<u8>),
     Indeterminate,
-    Warning(u8),
+    Warning(Option<u8>),
 }
 
 bitflags! {
@@ -1421,11 +1421,12 @@ where
                         None => Some(Progress::Error(None)),
                     },
                     Some(b"3") => Some(Progress::Indeterminate),
-                    Some(b"4") => params
-                        .get(3)
-                        .and_then(|value| parse_number(value))
-                        .filter(|value| *value <= 100)
-                        .map(Progress::Warning),
+                    Some(b"4") => match params.get(3).filter(|value| !value.is_empty()) {
+                        Some(value) => parse_number(value)
+                            .filter(|value| *value <= 100)
+                            .map(|value| Progress::Warning(Some(value))),
+                        None => Some(Progress::Warning(None)),
+                    },
                     _ => None,
                 };
 
@@ -2368,7 +2369,8 @@ mod tests {
             (b"\x1b]9;4;2;\x1b\\".as_slice(), Progress::Error(None)),
             (b"\x1b]9;4;2;75\x1b\\".as_slice(), Progress::Error(Some(75))),
             (b"\x1b]9;4;3\x1b\\".as_slice(), Progress::Indeterminate),
-            (b"\x1b]9;4;4;25\x1b\\".as_slice(), Progress::Warning(25)),
+            (b"\x1b]9;4;4\x1b\\".as_slice(), Progress::Warning(None)),
+            (b"\x1b]9;4;4;25\x1b\\".as_slice(), Progress::Warning(Some(25))),
         ];
 
         for (bytes, expected) in cases {
