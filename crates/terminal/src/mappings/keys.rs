@@ -49,6 +49,12 @@ pub(crate) fn to_esc_str(
     mode: Modes,
     option_as_meta: bool,
 ) -> Option<Cow<'static, str>> {
+    if mode.contains(Modes::DISAMBIGUATE_ESC_CODES)
+        && let Some(sequence) = kitty_disambiguated_sequence(keystroke)
+    {
+        return Some(sequence);
+    }
+
     let modifiers = TerminalModifiers::new(keystroke);
 
     // Manual Bindings including modifiers
@@ -228,6 +234,90 @@ pub(crate) fn to_esc_str(
     None
 }
 
+fn kitty_disambiguated_sequence(keystroke: &Keystroke) -> Option<Cow<'static, str>> {
+    let modifier_code = kitty_modifier_code(keystroke);
+    let sequence = match keystroke.key.as_ref() {
+        "enter" if modifier_code == 1 => return Some(Cow::Borrowed("\x0d")),
+        "tab" if modifier_code == 1 => return Some(Cow::Borrowed("\x09")),
+        "backspace" if modifier_code == 1 => return Some(Cow::Borrowed("\x7f")),
+        "escape" if modifier_code == 1 => return Some(Cow::Borrowed("\x1b[27u")),
+        "enter" => format!("\x1b[13;{modifier_code}u"),
+        "tab" => format!("\x1b[9;{modifier_code}u"),
+        "backspace" => format!("\x1b[127;{modifier_code}u"),
+        "escape" => format!("\x1b[27;{modifier_code}u"),
+        "space" if kitty_modifier_requires_disambiguation(keystroke) => {
+            format!("\x1b[32;{modifier_code}u")
+        }
+        "up" => format!("\x1b[1;{modifier_code}A"),
+        "down" => format!("\x1b[1;{modifier_code}B"),
+        "right" => format!("\x1b[1;{modifier_code}C"),
+        "left" => format!("\x1b[1;{modifier_code}D"),
+        "home" => format!("\x1b[1;{modifier_code}H"),
+        "end" => format!("\x1b[1;{modifier_code}F"),
+        "f1" => format!("\x1b[1;{modifier_code}P"),
+        "f2" => format!("\x1b[1;{modifier_code}Q"),
+        "f3" => format!("\x1b[1;{modifier_code}R"),
+        "f4" => format!("\x1b[1;{modifier_code}S"),
+        "insert" => format!("\x1b[2;{modifier_code}~"),
+        "delete" => format!("\x1b[3;{modifier_code}~"),
+        "pageup" => format!("\x1b[5;{modifier_code}~"),
+        "pagedown" => format!("\x1b[6;{modifier_code}~"),
+        "f5" => format!("\x1b[15;{modifier_code}~"),
+        "f6" => format!("\x1b[17;{modifier_code}~"),
+        "f7" => format!("\x1b[18;{modifier_code}~"),
+        "f8" => format!("\x1b[19;{modifier_code}~"),
+        "f9" => format!("\x1b[20;{modifier_code}~"),
+        "f10" => format!("\x1b[21;{modifier_code}~"),
+        "f11" => format!("\x1b[23;{modifier_code}~"),
+        "f12" => format!("\x1b[24;{modifier_code}~"),
+        "f13" => format!("\x1b[25;{modifier_code}~"),
+        "f14" => format!("\x1b[26;{modifier_code}~"),
+        "f15" => format!("\x1b[28;{modifier_code}~"),
+        "f16" => format!("\x1b[29;{modifier_code}~"),
+        "f17" => format!("\x1b[31;{modifier_code}~"),
+        "f18" => format!("\x1b[32;{modifier_code}~"),
+        "f19" => format!("\x1b[33;{modifier_code}~"),
+        "f20" => format!("\x1b[34;{modifier_code}~"),
+        key if kitty_modifier_requires_disambiguation(keystroke) => {
+            let mut characters = key.chars();
+            let character = characters.next()?;
+            if characters.next().is_some() {
+                return None;
+            }
+            let character = if keystroke.modifiers.shift {
+                character.to_ascii_lowercase()
+            } else {
+                character
+            };
+            format!("\x1b[{};{modifier_code}u", u32::from(character))
+        }
+        _ => return None,
+    };
+
+    Some(Cow::Owned(sequence))
+}
+
+fn kitty_modifier_requires_disambiguation(keystroke: &Keystroke) -> bool {
+    keystroke.modifiers.alt || keystroke.modifiers.control || keystroke.modifiers.platform
+}
+
+fn kitty_modifier_code(keystroke: &Keystroke) -> u32 {
+    let mut modifier_code = 0;
+    if keystroke.modifiers.shift {
+        modifier_code |= 1;
+    }
+    if keystroke.modifiers.alt {
+        modifier_code |= 1 << 1;
+    }
+    if keystroke.modifiers.control {
+        modifier_code |= 1 << 2;
+    }
+    if keystroke.modifiers.platform {
+        modifier_code |= 1 << 3;
+    }
+    modifier_code + 1
+}
+
 ///   Code     Modifiers
 /// ---------+---------------------------
 ///    2     | Shift
@@ -391,6 +481,90 @@ mod test {
 
         // Regular enter should still send carriage return
         assert_eq!(to_esc_str(&regular_enter, mode, false), Some("\x0d".into()));
+    }
+
+    #[test]
+    fn test_kitty_disambiguated_question_navigation() {
+        let mode = Modes::DISAMBIGUATE_ESC_CODES;
+
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("enter").expect("enter should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x0d".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("up").expect("up should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x1b[1;1A".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("down").expect("down should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x1b[1;1B".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("left").expect("left should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x1b[1;1D".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("right").expect("right should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x1b[1;1C".into())
+        );
+    }
+
+    #[test]
+    fn test_kitty_disambiguates_modified_keys() {
+        let mode = Modes::DISAMBIGUATE_ESC_CODES;
+
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("shift-enter").expect("shift-enter should be valid"),
+                mode,
+                false,
+            ),
+            Some("\x1b[13;2u".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("ctrl-c").expect("ctrl-c should be valid"),
+                mode,
+                false,
+            ),
+            Some("\x1b[99;5u".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("ctrl-space").expect("ctrl-space should be valid"),
+                mode,
+                false,
+            ),
+            Some("\x1b[32;5u".into())
+        );
+        assert_eq!(
+            to_esc_str(
+                &Keystroke::parse("escape").expect("escape should be a valid keystroke"),
+                mode,
+                false,
+            ),
+            Some("\x1b[27u".into())
+        );
     }
 
     #[test]

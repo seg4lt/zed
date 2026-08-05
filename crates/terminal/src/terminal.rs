@@ -399,6 +399,7 @@ impl Modes {
     pub const MOUSE_DRAG: Self = Self(1 << 14);
     pub const MOUSE_MOTION: Self = Self(1 << 15);
     pub const VI: Self = Self(1 << 16);
+    pub const DISAMBIGUATE_ESC_CODES: Self = Self(1 << 17);
     pub const MOUSE_MODE: Self =
         Self(Self::MOUSE_REPORT_CLICK.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);
 
@@ -679,6 +680,11 @@ pub fn insert_zed_terminal_env(
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), term_program_version);
+}
+
+fn terminal_advertises_kitty_keyboard_protocol(env: &HashMap<String, String>) -> bool {
+    env.get("TERM_PROGRAM")
+        .is_some_and(|term_program| term_program.eq_ignore_ascii_case("ghostty"))
 }
 
 ///Upward flowing events, for changing the title and such
@@ -1104,6 +1110,7 @@ impl TerminalBuilder {
             }
 
             insert_zed_terminal_env(&mut env, &version);
+            let kitty_keyboard = terminal_advertises_kitty_keyboard_protocol(&env);
 
             #[derive(Default)]
             struct ShellParams {
@@ -1175,7 +1182,7 @@ impl TerminalBuilder {
                     .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
                     .min(MAX_SCROLL_HISTORY_LINES)
             };
-            let config = pty_term_config(scrolling_history, cursor_shape);
+            let config = pty_term_config(scrolling_history, cursor_shape, kitty_keyboard);
 
             //Spawn a task so the Alacritty EventLoop (or the subprocess reader) can communicate with us
             //TODO: Remove with a bounded sender which can be dispatched on &self
@@ -3479,6 +3486,10 @@ mod tests {
         );
         assert!(!environment.contains_key("ZED_TERM_PROGRAM_OVERRIDE"));
         assert!(!environment.contains_key("ZED_TERM_PROGRAM_VERSION_OVERRIDE"));
+        assert!(terminal_advertises_kitty_keyboard_protocol(&environment));
+
+        environment.insert("TERM_PROGRAM".to_string(), "zed".to_string());
+        assert!(!terminal_advertises_kitty_keyboard_protocol(&environment));
     }
 
     #[test]

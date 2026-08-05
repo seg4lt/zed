@@ -131,10 +131,12 @@ pub(super) fn display_only_term_config(
 pub(super) fn pty_term_config(
     scrolling_history: usize,
     cursor_shape: SettingsCursorShape,
+    kitty_keyboard: bool,
 ) -> AlacrittyTermConfig {
     Config {
         scrolling_history,
         default_cursor_style: alacritty_cursor_style(cursor_shape),
+        kitty_keyboard,
         ..Config::default()
     }
 }
@@ -610,6 +612,12 @@ impl Modes {
         add_alacritty_mode(&mut mode, self, Self::MOUSE_DRAG, TermMode::MOUSE_DRAG);
         add_alacritty_mode(&mut mode, self, Self::MOUSE_MOTION, TermMode::MOUSE_MOTION);
         add_alacritty_mode(&mut mode, self, Self::VI, TermMode::VI);
+        add_alacritty_mode(
+            &mut mode,
+            self,
+            Self::DISAMBIGUATE_ESC_CODES,
+            TermMode::DISAMBIGUATE_ESC_CODES,
+        );
         mode
     }
 }
@@ -703,6 +711,12 @@ fn terminal_modes_from_alacritty(mode: TermMode) -> Modes {
         Modes::MOUSE_MOTION,
     );
     add_terminal_mode(&mut terminal_modes, mode, TermMode::VI, Modes::VI);
+    add_terminal_mode(
+        &mut terminal_modes,
+        mode,
+        TermMode::DISAMBIGUATE_ESC_CODES,
+        Modes::DISAMBIGUATE_ESC_CODES,
+    );
     terminal_modes
 }
 
@@ -1035,6 +1049,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use vte::ansi::{Processor, StdSyncHandler};
 
     #[test]
     fn terminal_hyperlink_from_alacritty_keeps_alacritty_storage() {
@@ -1066,7 +1081,8 @@ mod tests {
             | TermMode::ALT_SCREEN
             | TermMode::MOUSE_DRAG
             | TermMode::SGR_MOUSE
-            | TermMode::VI;
+            | TermMode::VI
+            | TermMode::DISAMBIGUATE_ESC_CODES;
 
         let terminal_modes = terminal_modes_from_alacritty(alacritty_modes);
         assert!(terminal_modes.contains(Modes::APP_CURSOR));
@@ -1076,6 +1092,7 @@ mod tests {
         assert!(terminal_modes.intersects(Modes::MOUSE_MODE));
         assert!(terminal_modes.contains(Modes::SGR_MOUSE));
         assert!(terminal_modes.contains(Modes::VI));
+        assert!(terminal_modes.contains(Modes::DISAMBIGUATE_ESC_CODES));
         assert!(!terminal_modes.contains(Modes::MOUSE_REPORT_CLICK));
 
         let alacritty_modes = terminal_modes.to_alacritty();
@@ -1085,7 +1102,50 @@ mod tests {
         assert!(alacritty_modes.contains(TermMode::MOUSE_DRAG));
         assert!(alacritty_modes.contains(TermMode::SGR_MOUSE));
         assert!(alacritty_modes.contains(TermMode::VI));
+        assert!(alacritty_modes.contains(TermMode::DISAMBIGUATE_ESC_CODES));
         assert!(!alacritty_modes.contains(TermMode::MOUSE_REPORT_CLICK));
+    }
+
+    #[test]
+    fn pty_config_enables_kitty_keyboard_protocol_when_advertised() {
+        let config = pty_term_config(100, SettingsCursorShape::default(), true);
+        assert!(config.kitty_keyboard);
+
+        let config = pty_term_config(100, SettingsCursorShape::default(), false);
+        assert!(!config.kitty_keyboard);
+    }
+
+    #[test]
+    fn claude_keyboard_negotiation_updates_terminal_input_mode() {
+        let config = pty_term_config(100, SettingsCursorShape::default(), true);
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let terminal = new_term(
+            &config,
+            TerminalBounds::default(),
+            events_tx,
+            AlternateScroll::On,
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        let mut terminal_lock = terminal.lock();
+        processor.advance(&mut *terminal_lock, b"\x1b[>1u");
+        drop(terminal_lock);
+
+        let mode = *terminal.lock().mode();
+        assert!(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        let mode = terminal_modes_from_alacritty(mode);
+        assert!(mode.contains(Modes::DISAMBIGUATE_ESC_CODES));
+        let down = gpui::Keystroke::parse("down").expect("down should be a valid keystroke");
+        let enter = gpui::Keystroke::parse("enter").expect("enter should be a valid keystroke");
+        assert_eq!(
+            crate::mappings::keys::to_esc_str(&down, mode, false),
+            Some("\x1b[1;1B".into())
+        );
+        assert_eq!(
+            crate::mappings::keys::to_esc_str(&enter, mode, false),
+            Some("\x0d".into())
+        );
     }
 
     #[test]

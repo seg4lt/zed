@@ -49,6 +49,7 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
+const SUPPORTED_KEYBOARD_MODES: KeyboardModes = KeyboardModes::DISAMBIGUATE_ESC_CODES;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1300,10 +1301,12 @@ impl<T: EventListener> Handler for Term<T> {
             return;
         }
 
+        let mode = mode & SUPPORTED_KEYBOARD_MODES;
+
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1335,7 +1338,7 @@ impl<T: EventListener> Handler for Term<T> {
             return;
         }
 
-        self.set_keyboard_mode(mode.into(), apply);
+        self.set_keyboard_mode((mode & SUPPORTED_KEYBOARD_MODES).into(), apply);
     }
 
     #[inline]
@@ -2528,6 +2531,39 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn kitty_keyboard_mode_uses_supported_flags_and_its_own_bounded_stack() {
+        let size = TermSize::new(5, 10);
+        let mut config = Config::default();
+        config.kitty_keyboard = true;
+        let mut term = Term::new(config, &size, VoidListener);
+
+        term.push_keyboard_mode(
+            KeyboardModes::DISAMBIGUATE_ESC_CODES | KeyboardModes::REPORT_EVENT_TYPES,
+        );
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!term.mode.contains(TermMode::REPORT_EVENT_TYPES));
+        assert_eq!(
+            term.keyboard_mode_stack,
+            vec![KeyboardModes::DISAMBIGUATE_ESC_CODES]
+        );
+
+        term.pop_keyboard_modes(1);
+        assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(term.keyboard_mode_stack.is_empty());
+
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
+            term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        }
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        assert!(term.title_stack.is_empty());
+    }
 
     #[test]
     fn scroll_display_page_up() {
