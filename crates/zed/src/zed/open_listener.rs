@@ -1045,11 +1045,22 @@ fn find_cli_terminal(
     gpui::Entity<workspace::Workspace>,
     gpui::Entity<terminal::Terminal>,
 )> {
+    find_cli_terminal_view(terminal_id, cx)
+        .map(|(workspace, view)| (workspace, view.read(cx).terminal().clone()))
+}
+
+fn find_cli_terminal_view(
+    terminal_id: &str,
+    cx: &App,
+) -> Option<(
+    gpui::Entity<workspace::Workspace>,
+    gpui::Entity<TerminalView>,
+)> {
     all_cli_terminals(cx)
         .into_iter()
         .filter_map(|entry| Some((entry.workspace, entry.terminal_id, entry.view?)))
         .find(|(_, agent_terminal_id, _)| terminal_cli_id(*agent_terminal_id) == terminal_id)
-        .map(|(workspace, _, view)| (workspace, view.read(cx).terminal().clone()))
+        .map(|(workspace, _, view)| (workspace, view))
 }
 
 async fn handle_terminal_cli_request(request: CliRequest, cx: &mut AsyncApp) -> Result<String> {
@@ -1366,14 +1377,14 @@ async fn handle_terminal_cli_request(request: CliRequest, cx: &mut AsyncApp) -> 
             serde_json::to_string_pretty(&snapshot).map_err(Into::into)
         }),
         CliRequest::WriteTerminal { terminal_id, input } => cx.update(|cx| {
-            let (_, terminal) = find_cli_terminal(&terminal_id, cx)
+            let (_, terminal_view) = find_cli_terminal_view(&terminal_id, cx)
                 .ok_or_else(|| anyhow!("terminal {terminal_id:?} is not open"))?;
-            terminal.update(cx, |terminal, cx| -> Result<()> {
+            terminal_view.update(cx, |terminal_view, cx| -> Result<()> {
                 anyhow::ensure!(
-                    !terminal.vi_mode_enabled(),
+                    !terminal_view.terminal().read(cx).vi_mode_enabled(),
                     "terminal is in Zed vi mode; send the `i` key before writing"
                 );
-                terminal.input(input, cx);
+                terminal_view.send_input(input, cx);
                 Ok(())
             })?;
             serde_json::to_string(&serde_json::json!({ "id": terminal_id, "written": true }))
@@ -1383,25 +1394,21 @@ async fn handle_terminal_cli_request(request: CliRequest, cx: &mut AsyncApp) -> 
             terminal_id,
             keystroke,
         } => cx.update(|cx| {
-            let (_, terminal) = find_cli_terminal(&terminal_id, cx)
+            let (_, terminal_view) = find_cli_terminal_view(&terminal_id, cx)
                 .ok_or_else(|| anyhow!("terminal {terminal_id:?} is not open"))?;
             let parsed = Keystroke::parse(&keystroke)
                 .with_context(|| format!("invalid keystroke {keystroke:?}"))?;
-            let handled = terminal.update(cx, |terminal, cx| -> Result<bool> {
-                terminal.refresh_content_snapshot();
-                if terminal.vi_mode_enabled() {
+            let handled = terminal_view.update(cx, |terminal_view, cx| -> Result<bool> {
+                terminal_view
+                    .terminal()
+                    .update(cx, |terminal, _cx| terminal.refresh_content_snapshot());
+                if terminal_view.terminal().read(cx).vi_mode_enabled() {
                     anyhow::ensure!(
                         parsed.key == "i" && !parsed.modifiers.modified(),
                         "terminal is in Zed vi mode; send the `i` key to return to terminal input"
                     );
-                    terminal.exit_vi_mode();
-                    return Ok(true);
                 }
-                Ok(terminal.try_keystroke(
-                    &parsed,
-                    terminal::terminal_settings::TerminalSettings::get_global(cx).option_as_meta,
-                    cx,
-                ))
+                Ok(terminal_view.send_keystroke(&parsed, cx))
             })?;
             anyhow::ensure!(
                 handled,
@@ -1998,6 +2005,7 @@ mod tests {
     use serde_json::json;
     use session::Session;
     use std::{path::Path, sync::Arc, task::Poll};
+    use ui::AgentThreadStatus;
     use util::path;
     use workspace::{AppState, MultiWorkspace, ProjectGroup};
 
@@ -2074,16 +2082,99 @@ mod tests {
                 .any(|terminal| terminal["id"] == terminal_cli_id(existing_terminal))
         }));
 
+        let existing_terminal_id = terminal_cli_id(existing_terminal);
+        let existing_terminal_view = panel
+            .read_with(cx, |panel, _cx| {
+                panel
+                    .terminal_views()
+                    .into_iter()
+                    .find(|(terminal_id, _)| *terminal_id == existing_terminal)
+                    .map(|(_, view)| view)
+            })
+            .expect("existing terminal should have a view");
+        let existing_terminal_entity =
+            existing_terminal_view.read_with(cx, |view, _cx| view.terminal().clone());
+        let initial_input_generation =
+            existing_terminal_entity.read_with(cx, |terminal, _cx| terminal.input_generation());
+        window
+            .update(cx, |_multi_workspace, window, cx| {
+                existing_terminal_entity.update(cx, |terminal, cx| {
+                    terminal.write_output(b"\x1b]9;4;3\x07", cx);
+                    terminal.sync(window, cx);
+                });
+            })
+            .expect("workspace window should be available");
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .terminals(cx)
+                    .into_iter()
+                    .find(|terminal| terminal.id == existing_terminal)
+                    .map(|terminal| terminal.status)
+            }),
+            Some(AgentThreadStatus::Running)
+        );
+
+        cx.spawn({
+            let existing_terminal_id = existing_terminal_id.clone();
+            |mut cx| async move {
+                handle_terminal_cli_request(
+                    CliRequest::WriteTerminal {
+                        terminal_id: existing_terminal_id,
+                        input: b"claude".to_vec(),
+                    },
+                    &mut cx,
+                )
+                .await
+            }
+        })
+        .await
+        .expect("writing through the terminal CLI should succeed");
+        cx.spawn(move |mut cx| async move {
+            handle_terminal_cli_request(
+                CliRequest::SendTerminalKey {
+                    terminal_id: existing_terminal_id,
+                    keystroke: "enter".to_string(),
+                },
+                &mut cx,
+            )
+            .await
+        })
+        .await
+        .expect("sending Enter through the terminal CLI should succeed");
+        cx.run_until_parked();
+
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| {
+                panel
+                    .terminals(cx)
+                    .into_iter()
+                    .find(|terminal| terminal.id == existing_terminal)
+                    .map(|terminal| terminal.status)
+            }),
+            Some(AgentThreadStatus::Running)
+        );
+        assert_eq!(
+            existing_terminal_entity.read_with(cx, |terminal, _cx| terminal.input_generation()),
+            initial_input_generation.wrapping_add(2)
+        );
+
         let command = if cfg!(windows) {
             vec![
                 "cmd.exe".to_string(),
                 "/D".to_string(),
                 "/C".to_string(),
-                "exit".to_string(),
-                "0".to_string(),
+                "echo agent_term_program=%TERM_PROGRAM% term_version=%TERM_PROGRAM_VERSION%"
+                    .to_string(),
             ]
         } else {
-            vec!["true".to_string()]
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf 'agent_term_program=%s term_version=%s\\n' \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\""
+                    .to_string(),
+            ]
         };
         let spawn_result = cx
             .spawn(move |mut cx| async move {
@@ -2107,6 +2198,34 @@ mod tests {
             .expect("spawn result should contain a terminal ID")
             .to_string();
         assert!(spawned_terminal_id.starts_with("terminal-"));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let content = panel.read_with(cx, |panel, cx| {
+                panel
+                    .terminal_views()
+                    .into_iter()
+                    .find(|(terminal_id, _)| terminal_cli_id(*terminal_id) == spawned_terminal_id)
+                    .map(|(_, view)| {
+                        view.read(cx)
+                            .terminal()
+                            .read_with(cx, |terminal, _| terminal.get_content())
+                    })
+            });
+            if content.as_deref().is_some_and(|content| {
+                content.contains("agent_term_program=ghostty term_version=1.2.0")
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned command did not receive the agent terminal environment; content={content:?}"
+            );
+            cx.background_executor
+                .timer(Duration::from_millis(50))
+                .await;
+        }
 
         let terminal_list = cx
             .spawn(|mut cx| async move {

@@ -971,18 +971,17 @@ impl TerminalView {
     }
 
     fn send_text(&mut self, text: &SendText, _: &mut Window, cx: &mut Context<Self>) {
-        self.clear_bell(cx);
-        self.blink_manager.update(cx, BlinkManager::pause_blinking);
-        self.terminal.update(cx, |term, cx| {
-            term.input(text.0.to_string().into_bytes(), cx);
-        });
+        self.send_input(text.0.to_string().into_bytes(), cx);
     }
 
-    fn send_keystroke(&mut self, text: &SendKeystroke, _: &mut Window, cx: &mut Context<Self>) {
+    fn send_keystroke_action(
+        &mut self,
+        text: &SendKeystroke,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
-            self.clear_bell(cx);
-            self.blink_manager.update(cx, BlinkManager::pause_blinking);
-            self.process_keystroke(&keystroke, cx);
+            self.send_keystroke(&keystroke, cx);
         }
     }
 
@@ -1287,11 +1286,21 @@ impl TerminalView {
         handled
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn send_input(&mut self, input: Vec<u8>, cx: &mut Context<Self>) {
         self.clear_bell(cx);
-        self.pause_cursor_blinking(window, cx);
+        self.blink_manager.update(cx, BlinkManager::pause_blinking);
+        self.terminal
+            .update(cx, |terminal, cx| terminal.input(input, cx));
+    }
 
-        if self.process_keystroke(&event.keystroke, cx) {
+    pub fn send_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        self.clear_bell(cx);
+        self.blink_manager.update(cx, BlinkManager::pause_blinking);
+        self.process_keystroke(keystroke, cx)
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.send_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
     }
@@ -1354,7 +1363,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle(cx))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
-            .on_action(cx.listener(TerminalView::send_keystroke))
+            .on_action(cx.listener(TerminalView::send_keystroke_action))
             .on_action(cx.listener(TerminalView::copy))
             .on_action(cx.listener(TerminalView::editor_copy))
             .on_action(cx.listener(TerminalView::paste))

@@ -287,6 +287,15 @@ impl Project {
         })
     }
 
+    pub fn create_agent_terminal_task(
+        &mut self,
+        mut spawn_task: SpawnInTerminal,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        spawn_task.env.extend(agent_terminal_environment());
+        self.create_terminal_task(spawn_task, cx)
+    }
+
     pub fn create_terminal_shell(
         &mut self,
         cwd: Option<PathBuf>,
@@ -300,21 +309,7 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(
-            cwd,
-            false,
-            HashMap::from_iter([
-                (
-                    "ZED_TERM_PROGRAM_OVERRIDE".to_string(),
-                    "ghostty".to_string(),
-                ),
-                (
-                    "ZED_TERM_PROGRAM_VERSION_OVERRIDE".to_string(),
-                    "1.2.0".to_string(),
-                ),
-            ]),
-            cx,
-        )
+        self.create_terminal_shell_internal(cwd, false, agent_terminal_environment(), cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -634,6 +629,19 @@ impl Project {
             Task::ready(None).shared()
         }
     }
+}
+
+fn agent_terminal_environment() -> HashMap<String, String> {
+    HashMap::from_iter([
+        (
+            "ZED_TERM_PROGRAM_OVERRIDE".to_string(),
+            "ghostty".to_string(),
+        ),
+        (
+            "ZED_TERM_PROGRAM_VERSION_OVERRIDE".to_string(),
+            "1.2.0".to_string(),
+        ),
+    ])
 }
 
 fn create_remote_shell(

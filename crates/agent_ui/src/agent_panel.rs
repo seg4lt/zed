@@ -3623,7 +3623,7 @@ impl AgentPanel {
         } else {
             let label = command.join(" ");
             self.project.update(cx, |project, cx| {
-                project.create_terminal_task(
+                project.create_agent_terminal_task(
                     SpawnInTerminal {
                         id: TaskId(format!("agent-cli-{terminal_id}")),
                         full_label: label.clone(),
